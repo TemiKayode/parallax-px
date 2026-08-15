@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 440" width="640" height="440" font-family="ui-monospace,SFMono-Regular,Menlo,monospace">
+<rect width="640" height="440" fill="#ffffff"/>
+<text x="56" y="28" font-size="15" font-weight="600" fill="#1a1a1a">Reliability — is the model calibrated?</text>
+<text x="56" y="46" font-size="11" fill="#8a8a8a">n = 12854   skill vs venue mid = -0.0640   reliability = 0.01219   resolution = 0.09154</text>
+<line x1="56.0" y1="384.0" x2="616.0" y2="384.0" stroke="#e4e4e4" stroke-width="1"/>
+<text x="50.0" y="387.5" font-size="10" fill="#8a8a8a" text-anchor="end">0.0</text>
+<line x1="56.0" y1="320.0" x2="616.0" y2="320.0" stroke="#e4e4e4" stroke-width="1"/>
+<text x="50.0" y="323.5" font-size="10" fill="#8a8a8a" text-anchor="end">0.2</text>
+<line x1="56.0" y1="256.0" x2="616.0" y2="256.0" stroke="#e4e4e4" stroke-width="1"/>
+<text x="50.0" y="259.5" font-size="10" fill="#8a8a8a" text-anchor="end">0.4</text>
+<line x1="56.0" y1="192.0" x2="616.0" y2="192.0" stroke="#e4e4e4" stroke-width="1"/>
+<text x="50.0" y="195.5" font-size="10" fill="#8a8a8a" text-anchor="end">0.6</text>
+<line x1="56.0" y1="128.0" x2="616.0" y2="128.0" stroke="#e4e4e4" stroke-width="1"/>
+<text x="50.0" y="131.5" font-size="10" fill="#8a8a8a" text-anchor="end">0.8</text>
+<line x1="56.0" y1="64.0" x2="616.0" y2="64.0" stroke="#e4e4e4" stroke-width="1"/>
+<text x="50.0" y="67.5" font-size="10" fill="#8a8a8a" text-anchor="end">1.0</text>
+<text x="56.0" y="400.0" font-size="10" fill="#8a8a8a" text-anchor="middle">0.0</text>
+<text x="168.0" y="400.0" font-size="10" fill="#8a8a8a" text-anchor="middle">0.2</text>
+<text x="280.0" y="400.0" font-size="10" fill="#8a8a8a" text-anchor="middle">0.4</text>
+<text x="392.0" y="400.0" font-size="10" fill="#8a8a8a" text-anchor="middle">0.6</text>
+<text x="504.0" y="400.0" font-size="10" fill="#8a8a8a" text-anchor="middle">0.8</text>
+<text x="616.0" y="400.0" font-size="10" fill="#8a8a8a" text-anchor="middle">1.0</text>
+<line x1="56.0" y1="64.0" x2="56.0" y2="384.0" stroke="#1a1a1a" stroke-width="1.2"/>
+<line x1="56.0" y1="384.0" x2="616.0" y2="384.0" stroke="#1a1a1a" stroke-width="1.2"/>
+<text x="336.0" y="426.0" font-size="11" fill="#1a1a1a" text-anchor="middle">forecast probability</text>
+<text x="14" y="224.0" font-size="11" fill="#1a1a1a" text-anchor="middle" transform="rotate(-90 14 224.0)">observed frequency</text>
+<line x1="56.0" y1="384.0" x2="616.0" y2="64.0" stroke="#8a8a8a" stroke-width="1" stroke-dasharray="4 4"/>
+<text x="364.0" y="224.0" font-size="10" fill="#8a8a8a">perfect calibration</text>
+<polyline points="67.1,315.0 139.6,313.2 195.6,265.6 251.5,239.5 309.6,242.8 362.4,242.2 419.4,210.0 478.6,129.7 532.6,89.9 602.8,78.5" fill="none" stroke="#c2410c" stroke-width="1.8"/>
+<circle cx="67.1" cy="315.0" r="11.0" fill="#b91c1c" fill-opacity="0.75"/>
+<text x="83.1" y="315.0" font-size="9" fill="#b91c1c">said 2%, was 22% (n=2745)</text>
+<circle cx="139.6" cy="313.2" r="7.4" fill="#c2410c" fill-opacity="0.75"/>
+<circle cx="195.6" cy="265.6" r="7.2" fill="#b91c1c" fill-opacity="0.75"/>
+<text x="207.8" y="265.6" font-size="9" fill="#b91c1c">said 25%, was 37% (n=765)</text>
+<circle cx="251.5" cy="239.5" r="7.4" fill="#b91c1c" fill-opacity="0.75"/>
+<text x="263.9" y="239.5" font-size="9" fill="#b91c1c">said 35%, was 45% (n=844)</text>
+<circle cx="309.6" cy="242.8" r="7.3" fill="#c2410c" fill-opacity="0.75"/>
+<circle cx="362.4" cy="242.2" r="7.8" fill="#b91c1c" fill-opacity="0.75"/>
+<text x="375.2" y="242.2" font-size="9" fill="#b91c1c">said 55%, was 44% (n=984)</text>
+<circle cx="419.4" cy="210.0" r="7.5" fill="#b91c1c" fill-opacity="0.75"/>
+<text x="431.9" y="210.0" font-size="9" fill="#b91c1c">said 65%, was 54% (n=857)</text>
+<circle cx="478.6" cy="129.7" r="6.9" fill="#c2410c" fill-opacity="0.75"/>
+<circle cx="532.6" cy="89.9" r="7.7" fill="#c2410c" fill-opacity="0.75"/>
+<circle cx="602.8" cy="78.5" r="12.0" fill="#c2410c" fill-opacity="0.75"/>
+</svg>

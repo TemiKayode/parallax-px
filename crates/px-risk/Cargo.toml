@@ -1,0 +1,9 @@
+[package]
+name = "px-risk"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+px-core = { path = "../px-core" }
+px-edge = { path = "../px-edge" }

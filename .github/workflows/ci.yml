@@ -1,0 +1,100 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+# Cancel superseded runs on the same branch rather than queueing them.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Fail the build on any warning. A warning that is allowed to persist stops
+  # being read, and the whole point of the deny-list in each crate is that
+  # nobody has to remember to look.
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  test:
+    name: test (${{ matrix.os }}, ${{ matrix.rust }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Do not cancel the whole matrix when one cell fails — knowing whether a
+      # failure is platform-specific or universal is most of the diagnosis.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        rust: [stable]
+        include:
+          # The version floor declared in Cargo.toml. If this cell fails, either
+          # the code used a newer feature or the floor needs raising — both are
+          # decisions, not accidents.
+          - os: ubuntu-latest
+            rust: "1.75.0"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test (debug)
+        run: cargo test --workspace --all-targets
+
+      # Release matters separately: the workspace sets `panic = "abort"`,
+      # `lto = "fat"` and `opt-level = 3`, and overflow checks are off. Code that
+      # passes in debug can still be wrong in release — the integer-overflow and
+      # subnormal-exp bugs in this repo's history were both release-shaped.
+      - name: Test (release)
+        run: cargo test --workspace --release
+
+      - name: Build binaries
+        run: cargo build --release --workspace
+
+  # Deterministic-replay contract: the same seed must produce the same result on
+  # every platform. This is the property the whole testing story rests on, so it
+  # gets its own job rather than hiding inside the matrix.
+  determinism:
+    name: cross-platform determinism
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Replay with a fixed seed
+        run: cargo run --release --bin px-replay | tee replay-${{ matrix.os }}.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: replay-${{ matrix.os }}
+          path: replay-${{ matrix.os }}.txt
+
+  docs:
+    name: docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: rustdoc
+        run: cargo doc --workspace --no-deps
+        env:
+          RUSTDOCFLAGS: "-D warnings"

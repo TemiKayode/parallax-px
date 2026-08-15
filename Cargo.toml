@@ -1,0 +1,30 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/px-core",
+    "crates/px-alpha",
+    "crates/px-edge",
+    "crates/px-inventory",
+    "crates/px-selector",
+    "crates/px-risk",
+    "crates/px-score",
+    "crates/px-plot",
+    "crates/px-engine",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = 1
+
+# The hot path must never allocate, never lock, and never panic in release.
+# `panic = "abort"` is deliberate: a panic on the critical path is a correctness
+# failure, and we would rather lose the process (and let the dead-man switch
+# cancel every resting order) than continue with corrupt state.

@@ -1,0 +1,23 @@
+[package]
+name = "px-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+px-core = { path = "../px-core" }
+px-alpha = { path = "../px-alpha" }
+px-edge = { path = "../px-edge" }
+px-inventory = { path = "../px-inventory" }
+px-selector = { path = "../px-selector" }
+px-risk = { path = "../px-risk" }
+px-score = { path = "../px-score" }
+px-plot = { path = "../px-plot" }
+
+[[bin]]
+name = "px-bench"
+path = "src/bin/bench.rs"
+
+[[bin]]
+name = "px-replay"
+path = "src/bin/replay.rs"
