@@ -23,6 +23,34 @@ use px_engine::replay::{
     Outage, Report, Shock, SimConfig, VenueQuoteSource,
 };
 
+/// Parses `tools/px-record`'s reference-price format —
+/// `t_unix,bid,ask,last`, `#`-prefixed comments skipped — into
+/// `(t_unix, mid)` pairs for `px_engine::calibration::lag_correlation`.
+/// Lives here rather than in `px-engine` itself since it is specific to
+/// this one file format, not a general recording concept the library
+/// needs to expose.
+fn parse_reference_csv(text: &str) -> Vec<(f64, f64)> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let cols: Vec<&str> = line.split(',').collect();
+        if cols.len() != 4 {
+            continue;
+        }
+        let parse = |s: &str| s.trim().parse::<f64>().ok().filter(|v: &f64| v.is_finite());
+        let (Some(t_unix), Some(bid), Some(ask)) = (parse(cols[0]), parse(cols[1]), parse(cols[2]))
+        else {
+            continue;
+        };
+        out.push((t_unix, (bid + ask) / 2.0));
+    }
+    out.sort_by(|a, b| a.0.total_cmp(&b.0));
+    out
+}
+
 fn header() {
     println!(
         "{:<20} {:>10} {:>9} {:>6} {:>11} {:>11} {:>6} {:>6}",
@@ -275,11 +303,130 @@ fn main() {
     }
 
     // ---------------------------------------------------------------
-    // Is SimConfig::venue_depth calibrated against a real book?
+    // Is SimConfig calibrated against real data? All four parameters
+    // GOING-LIVE.md's own "every parameter in a simulator config is a
+    // guess until it has been checked against real flow" was written
+    // about.
     // ---------------------------------------------------------------
     println!("\n\n{}", "=".repeat(72));
-    println!("IS venue_depth CALIBRATED AGAINST A REAL BOOK?");
+    println!("IS SimConfig CALIBRATED AGAINST REAL DATA?");
     println!("{}\n", "=".repeat(72));
+
+    // --- venue_half_spread, venue_noise: recordings/polymarket_calibration_sample.csv ---
+    {
+        let raw = include_str!("../../../../recordings/polymarket_calibration_sample.csv");
+        let market = "btc-updown-4h-1786852800";
+        let quotes = px_engine::recording::load_recording(raw, market);
+        if quotes.is_empty() {
+            println!("  no calibration recording available for {market} — skipped.");
+        } else {
+            let assumed_half_spread = SimConfig::default().venue_half_spread as f64 / 1_000_000.0;
+            let observed = px_engine::calibration::observed_half_spreads(&quotes);
+            if let Some((mean, std)) = px_engine::calibration::mean_std(&observed) {
+                println!(
+                    "venue_half_spread — {} real snapshots of {market}",
+                    quotes.len()
+                );
+                println!(
+                    "  assumed (SimConfig::default): {:>8.4}   observed: mean {:>8.4}  std {:>8.4}",
+                    assumed_half_spread, mean, std
+                );
+            }
+
+            let assumed_noise = SimConfig::default().venue_noise;
+            let noise = px_engine::calibration::observed_noise(&quotes, 5);
+            if let Some((mean, std)) = px_engine::calibration::mean_std(&noise) {
+                println!(
+                    "\nvenue_noise — deviation of each mid from a trailing 5-snapshot rolling mean"
+                );
+                println!(
+                    "  assumed (SimConfig::default): {:>8.4}   observed: mean {:>8.4}  std {:>8.4}",
+                    assumed_noise, mean, std
+                );
+                println!(
+                    "  (this is an analogue, not the same quantity: SimConfig::venue_noise perturbs\n  a *synthetic* venue's rebuilt quote around its own lagged \"true\" view; this\n  measures how much a *real* mid actually jitters around its own recent past.\n  Comparable in spirit — both describe short-term quote instability — not\n  a like-for-like unit conversion.)"
+                );
+            }
+        }
+    }
+
+    // --- venue_lag_s: cross-correlate real venue returns against the real
+    // BTC/USD reference feed, captured in the same session so the two
+    // series genuinely overlap in time. ---
+    println!("\nvenue_lag_s — lagged correlation, real BTC/USD reference vs real venue mid");
+    {
+        let raw_ref = include_str!("../../../../recordings/btc_reference_calibration_sample.csv");
+        let raw_venue = include_str!("../../../../recordings/polymarket_calibration_sample.csv");
+        let reference_series = parse_reference_csv(raw_ref);
+        let venue_series =
+            px_engine::calibration::venue_mid_series(raw_venue, "btc-updown-4h-1786852800");
+        if reference_series.len() < 2 || venue_series.len() < 2 {
+            println!("  not enough overlapping data — skipped.");
+        } else {
+            let lags: [f64; 7] = [-6.0, -3.0, 0.0, 0.4, 3.0, 6.0, 9.0];
+            let results =
+                px_engine::calibration::lag_correlation(&reference_series, &venue_series, &lags);
+            println!(
+                "  assumed venue_lag_s (SimConfig::default): {:.2}s",
+                SimConfig::default().venue_lag_s
+            );
+            print!("  lag(s)  ");
+            for (lag, _) in &results {
+                print!("{lag:>7.1}");
+            }
+            println!();
+            print!("  corr    ");
+            for (_, c) in &results {
+                match c {
+                    Some(c) => print!("{c:>7.3}"),
+                    None => print!("{:>7}", "n/a"),
+                }
+            }
+            println!();
+            // Negative lags (`reference(t + |lag|)`) are in the tried set
+            // on purpose, as a control: real information cannot flow
+            // backwards, so a genuine "venue lags the reference" effect
+            // can only show up at lag >= 0. The strongest hit landing at
+            // a negative lag is not just weak evidence, it is a direct
+            // tell that whatever the number is, it is not the effect
+            // being measured — a coincidence in a small sample, not a
+            // venue that predicts the future.
+            let best_causal = results
+                .iter()
+                .filter(|&&(lag, _)| lag >= 0.0)
+                .filter_map(|&(lag, c)| c.map(|c| (lag, c.abs())))
+                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+            let best_overall = results
+                .iter()
+                .filter_map(|&(lag, c)| c.map(|c| (lag, c.abs())))
+                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+            if let (Some((best_lag, best_corr)), Some((causal_lag, causal_corr))) =
+                (best_overall, best_causal)
+            {
+                if best_lag < 0.0 && best_corr > causal_corr {
+                    println!(
+                        "\n  The strongest |correlation| in the table is at lag {best_lag:.1}s (|r| = {best_corr:.3})\n  — a NEGATIVE lag, which is not physically possible as a real \"venue lags\n  reference\" effect (information cannot flow backwards). That is itself the\n  finding: this is small-sample noise, not signal. Restricted to lags >= 0,\n  the actual candidates for venue_lag_s, the best is only {causal_lag:.1}s at\n  |r| = {causal_corr:.3} — too weak to read as a real measurement.\n  Honest conclusion: {} real venue observations over an ~8-minute, largely\n  quiet window is not enough statistical power to calibrate venue_lag_s\n  either way. Not evidence the assumed 0.4s is wrong — evidence that this\n  measurement needs a longer, more volatile session\n  (tools/px-record's new unattended mode makes that practical) before it\n  can say anything at all.",
+                        venue_series.len()
+                    );
+                } else if causal_corr > 0.3 {
+                    println!(
+                        "\n  Strongest causal (lag >= 0) |correlation| at lag {causal_lag:.1}s (|r| = {causal_corr:.3}).\n  Read this as a weak signal, not a confident calibration: {} real venue\n  observations over an ~8-minute, largely quiet window is not much\n  statistical power for a lead-lag estimate, and the reference feed\n  (Bitstamp spot) is not necessarily what this venue's own book actually\n  prices off internally.",
+                        venue_series.len()
+                    );
+                } else {
+                    println!(
+                        "\n  No lag >= 0 in the range tried shows a real correlation (best |r| = {causal_corr:.3},\n  {} real venue observations). Honest reading: this ~8-minute real capture\n  did not contain enough genuine BTC price movement to estimate\n  venue_lag_s with any confidence either way — not evidence the assumed\n  0.4s is wrong, just that this measurement cannot yet say. A longer, more\n  volatile session (tools/px-record's new unattended mode makes that\n  practical) is the actual next step, not a number forced out of a quiet\n  sample.",
+                        venue_series.len()
+                    );
+                }
+            } else {
+                println!("\n  Not enough usable lag/correlation pairs to say anything.");
+            }
+        }
+    }
+
+    // --- venue_depth: recordings/polymarket_l2_sample.csv (full depth) ---
+    println!("\nvenue_depth — real resting size near the touch");
     {
         let raw_l2 = include_str!("../../../../recordings/polymarket_l2_sample.csv");
         let snaps = px_engine::recording::load_recording_l2(raw_l2, "btc-updown-5m-1786860300");
@@ -320,10 +467,7 @@ fn main() {
                 snaps.len()
             );
             println!(
-                "  assumed venue_depth (SimConfig::default):  {assumed:>10.1} shares per side"
-            );
-            println!(
-                "  observed, within {:.0}c of the touch:  bid {:>10.1}   ask {:>10.1}  (mean per snapshot)",
+                "  assumed (SimConfig::default): {assumed:>10.1} shares per side   observed, within {:.0}c of\n  the touch: bid {:>10.1}   ask {:>10.1}  (mean per snapshot)",
                 half_spread_px * 100.0,
                 bid_depth_sum / n,
                 ask_depth_sum / n

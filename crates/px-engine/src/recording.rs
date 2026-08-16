@@ -100,11 +100,13 @@ pub fn load_recording(text: &str, market: &str) -> Vec<RecordedQuote> {
 /// Shared parsing step behind `load_recording` and `complementarity_error`
 /// — sorted `(t_unix, RecordedQuote)` pairs with `t_s` still equal to the
 /// *absolute* recorded time, not yet normalised to start at 0. Kept
-/// separate specifically so `complementarity_error` can compare two
-/// markets' recordings against a shared clock; `load_recording` on its
-/// own has no reason to expose absolute time, since every other caller
-/// only ever replays one market's recording against its own start.
-fn parse_quote_rows(text: &str, market: &str) -> Vec<(f64, RecordedQuote)> {
+/// separate specifically so `complementarity_error` (and `calibration`'s
+/// lag analysis) can compare two markets' recordings against a shared
+/// clock; `load_recording` on its own has no reason to expose absolute
+/// time, since every other caller only ever replays one market's
+/// recording against its own start. `pub(crate)` rather than private so
+/// `crate::calibration` can reuse it without duplicating the parser.
+pub(crate) fn parse_quote_rows(text: &str, market: &str) -> Vec<(f64, RecordedQuote)> {
     let mut rows: Vec<(f64, RecordedQuote)> = Vec::new();
     for line in text.lines() {
         let line = line.trim();

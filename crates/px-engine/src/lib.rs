@@ -41,6 +41,7 @@
 )]
 #![warn(missing_debug_implementations, rust_2018_idioms)]
 
+pub mod calibration;
 pub mod recording;
 pub mod replay;
 pub mod stats;

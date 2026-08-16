@@ -93,7 +93,7 @@ wrong.
 
 ## Status: research prototype
 
-299 tests pass (plus 9 more in the standalone `tools/px-record`), debug and
+310 tests pass (plus 19 more in the standalone `tools/px-record`), debug and
 release. It is **not profitable in simulation** — median −$232 across 40
 seeds, 3/40 profitable. It has never touched a live venue and there is no
 code path that could.
@@ -168,6 +168,32 @@ care `px-core`'s fix required.
   (a fraction of a tick) across 150 matched pairs, max exactly one tick. A
   confirmatory finding, not just a corrective one: not every real measurement
   in this pass overturned an assumption, and this is the one that didn't.
+- **Is `SimConfig` actually calibrated against real data?** All four of
+  `venue_lag_s` / `venue_noise` / `venue_half_spread` / `venue_depth`, checked
+  in one place now — `px_engine::calibration` (unit-tested against synthetic
+  fixtures with a known injected lag before ever touching real data) plus a
+  `px-replay` section that runs it for real. `venue_half_spread`: assumed
+  0.015, observed mean 0.0077 — real spreads on the sampled market ran about
+  half as wide. `venue_noise`: assumed 0.004, observed std 0.0125 on an
+  analogous (not identical) real quantity — see the module doc on why it
+  isn't a literal unit match. `venue_lag_s` needed something no earlier
+  recording had: a *real reference feed*, captured *overlapping in time*
+  with real venue quotes. Binance/Coinbase/Kraken are unreachable from this
+  sandbox, but Bitstamp isn't — `tools/px-record` now polls it every tick
+  alongside the venue. Run for real: the strongest correlation in the lag
+  table landed at a *negative* lag, which is diagnostic of small-sample noise
+  on its own (information cannot flow backwards) rather than a usable
+  measurement — reported as exactly that, an honest "cannot say yet," not a
+  number forced out of eight quiet minutes.
+- **`tools/px-record`, rebuilt for unattended, multi-hour runs.**
+  `duration_secs = 0` now runs until Ctrl+C; the market list re-discovers on
+  an interval so a 5-minute market expiring mid-run gets dropped for whatever
+  replaced it instead of being polled dead for hours; a target that fails
+  `MAX_CONSECUTIVE_FAILURES` polls in a row is skipped until the next
+  re-discovery refreshes it, so one dead endpoint can't be hammered for the
+  rest of a long session. This is what made the `venue_lag_s` capture above
+  possible in the first place — real overlapping reference + venue data
+  needs a recorder built to run longer than a foreground demo.
 - **Clustered standard errors in `px-score`.** The paired t-test used to treat
   every logged forecast as independent, but `px-replay` pools ~200 per-second
   forecasts from each simulated seed — correlated within a seed, not across
