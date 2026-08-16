@@ -194,6 +194,14 @@ pub fn assess_take(
     finish_take(&walk, dir, fair, fees, sigma_p, p)
 }
 
+/// `fair.0` and `walk.avg_px.0`/`price.0` are always `Px`, bounded to
+/// `[0, 1_000_000]` by construction — any difference between two of them
+/// is well inside `i32`, the same proof `Walk::slippage_vs` already
+/// relies on. `net` is explicitly clamped into `i32` range before its
+/// only further use (`walk.filled.0`, a quantity with no such tight
+/// bound), which is hardened with `saturating_mul` rather than a bounds
+/// claim this function cannot make about a caller-supplied `Qty`.
+#[allow(clippy::arithmetic_side_effects)]
 fn finish_take(
     walk: &px_core::Walk,
     dir: Dir,
@@ -213,7 +221,7 @@ fn finish_take(
     let margin = margin_micro(sigma_p, p.safety_k);
     let net = ((gross as i64) - (fee as i64) - (margin as i64))
         .clamp(i32::MIN as i64, i32::MAX as i64) as i32;
-    let total = Usd(((net as i64) * walk.filled.0) / 1_000_000);
+    let total = Usd((net as i64).saturating_mul(walk.filled.0) / 1_000_000);
 
     TakeAssessment {
         qty: walk.filled,
@@ -238,6 +246,17 @@ fn finish_take(
 ///
 /// Returns the best assessment found, which may be `viable == false` if no size
 /// clears the hurdle.
+///
+/// `room` is provably positive: the closure returns early whenever
+/// `cum_qty >= max_qty.0`, so `max_qty.0 - cum_qty` never reaches this
+/// line except with `cum_qty` strictly smaller. `cum_cash` accumulates in
+/// `i128` for the same headroom reason `DenseBook::walk`'s does — see its
+/// doc comment. `avg`/`gross` are `Px`, bounded to `[0, 1_000_000]`, so
+/// their difference is well inside `i32`. The remaining products
+/// (`cum_qty`, `net as i64 * cum_qty`) involve a caller-supplied `Qty`
+/// with no tight bound this function can claim, so those are hardened
+/// with `saturating_*` instead of asserted safe.
+#[allow(clippy::arithmetic_side_effects)]
 pub fn optimal_take(
     book: &DenseBook,
     dir: Dir,
@@ -266,9 +285,9 @@ pub fn optimal_take(
             return false;
         }
 
-        cum_cash += (px.0 as i128) * (take as i128);
-        cum_qty += take;
-        levels += 1;
+        cum_cash += (px.0 as i128).saturating_mul(take as i128);
+        cum_qty = cum_qty.saturating_add(take);
+        levels = levels.saturating_add(1);
 
         let avg = Px((cum_cash / (cum_qty as i128)) as i32);
         let gross = match dir {
@@ -278,7 +297,7 @@ pub fn optimal_take(
         let fee = fees.taker_per_share(avg) as i32;
         let net = ((gross as i64) - (fee as i64) - (margin as i64))
             .clamp(i32::MIN as i64, i32::MAX as i64) as i32;
-        let total = ((net as i64) * cum_qty) / 1_000_000;
+        let total = (net as i64).saturating_mul(cum_qty) / 1_000_000;
 
         if net > 0 && total > best_total {
             best_total = total;
@@ -333,7 +352,12 @@ pub fn optimal_take(
 /// The credit is the inventory penalty the fill would retire. It is bounded by
 /// that penalty, so this cannot become a licence to buy at any price: once the
 /// position is flat the credit is zero and ordinary economics resume.
-#[allow(clippy::too_many_arguments)]
+///
+/// `mid.0`/`price.0`/`fair.0` are all `Px`, bounded to `[0, 1_000_000]` —
+/// `distance_ticks` and `gross` are both differences of two such values,
+/// well inside `i32`. `net`'s accumulation is bounded per the comment on
+/// it below.
+#[allow(clippy::too_many_arguments, clippy::arithmetic_side_effects)]
 pub fn assess_make(
     book: &DenseBook,
     dir: Dir,
@@ -351,7 +375,7 @@ pub fn assess_make(
     let side = dir.make_side();
     let queue_ahead = book.size_at(side, price);
     let mid = book.mid().unwrap_or(price);
-    let distance_ticks = ((mid.0 - price.0).abs() / book.tick.max(1)) as i32;
+    let distance_ticks = (mid.0 - price.0).abs() / book.tick.max(1);
 
     let gross = match dir {
         Dir::Buy => fair.0 - price.0,
@@ -422,6 +446,12 @@ impl AdverseSelectionEstimator {
     /// Record a mark-out. `fill_px` is where we were filled, `fair_after` is
     /// fair value at the mark-out horizon, `dir` is the side we were filled on.
     /// A positive result means the fill went against us.
+    ///
+    /// `fill_px.0`/`fair_after.0` are `Px`, bounded to `[0, 1_000_000]`, so
+    /// their difference is well inside `i32`. `n` uses `saturating_add`
+    /// rather than a "this will never realistically overflow" claim — it
+    /// costs nothing here and needs no justification at all.
+    #[allow(clippy::arithmetic_side_effects)]
     pub fn observe(&mut self, dir: Dir, fill_px: Px, fair_after: Px) {
         let loss = match dir {
             // We bought at fill_px; if fair fell below it, we lost the difference.
@@ -433,7 +463,7 @@ impl AdverseSelectionEstimator {
         } else {
             (1.0 - self.alpha) * self.ewma + self.alpha * loss
         };
-        self.n += 1;
+        self.n = self.n.saturating_add(1);
     }
 
     /// Current estimate, micro-dollars per share. Floored at zero: a negative
@@ -757,6 +787,10 @@ mod tests {
     }
 
     #[test]
+    // A freshly constructed estimator's `ewma` is the literal `0.0` it was
+    // initialised to, and `.max(0.0)` of that is exactly `0.0` — a real
+    // invariant, not a computation landing near zero.
+    #[allow(clippy::float_cmp)]
     fn adverse_estimator_learns_from_bad_fills() {
         let mut e = AdverseSelectionEstimator::new(0.1);
         assert_eq!(e.estimate(), 0.0);
@@ -769,6 +803,10 @@ mod tests {
     }
 
     #[test]
+    // `estimate()` is `self.ewma.max(0.0)` — IEEE 754's `f64::max` returns
+    // exactly `0.0` whenever `ewma` is negative, by definition, not by
+    // rounding luck.
+    #[allow(clippy::float_cmp)]
     fn adverse_estimator_floors_at_zero() {
         let mut e = AdverseSelectionEstimator::new(0.1);
         for _ in 0..200 {

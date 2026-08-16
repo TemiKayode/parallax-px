@@ -92,50 +92,66 @@ fn main() {
     let base = SimConfig::default();
     line("calm market", &run(&base));
 
-    let mut busy = SimConfig::default();
-    busy.flow_per_s = 5.0;
+    let busy = SimConfig {
+        flow_per_s: 5.0,
+        ..Default::default()
+    };
     line("heavy flow", &run(&busy));
 
-    let mut shocked = SimConfig::default();
-    shocked.shocks = vec![Shock {
-        at_s: 150.0,
-        magnitude: 0.006,
-    }];
+    let shocked = SimConfig {
+        shocks: vec![Shock {
+            at_s: 150.0,
+            magnitude: 0.006,
+        }],
+        ..Default::default()
+    };
     line("news shock +60bp", &run(&shocked));
 
-    let mut hostile = SimConfig::default();
-    hostile.shocks = (0..10)
-        .map(|i| Shock {
-            at_s: 30.0 + i as f64 * 25.0,
-            magnitude: if i % 2 == 0 { 0.004 } else { -0.004 },
-        })
-        .collect();
+    let hostile = SimConfig {
+        shocks: (0..10)
+            .map(|i| Shock {
+                at_s: 30.0 + i as f64 * 25.0,
+                magnitude: if i % 2 == 0 { 0.004 } else { -0.004 },
+            })
+            .collect(),
+        ..Default::default()
+    };
     line("whipsaw tape", &run(&hostile));
 
-    let mut outage = SimConfig::default();
-    outage.outages = vec![Outage {
-        feed_index: 0,
-        start_s: 100.0,
-        end_s: 160.0,
-    }];
+    let outage = SimConfig {
+        outages: vec![Outage {
+            feed_index: 0,
+            start_s: 100.0,
+            end_s: 160.0,
+        }],
+        ..Default::default()
+    };
     line("60s feed outage", &run(&outage));
 
-    let mut fast = SimConfig::default();
-    fast.venue_lag_s = 0.0;
-    fast.venue_noise = 0.0005;
+    let fast = SimConfig {
+        venue_lag_s: 0.0,
+        venue_noise: 0.0005,
+        ..Default::default()
+    };
     line("efficient venue", &run(&fast));
 
-    let mut endgame = SimConfig::default();
-    endgame.venue_lag_s = 0.8;
+    let endgame = SimConfig {
+        venue_lag_s: 0.8,
+        ..Default::default()
+    };
     line("twap endgame", &run(&endgame));
 
-    let mut geo = SimConfig::default();
-    geo.category = px_core::Category::Geopolitics;
+    let geo = SimConfig {
+        category: px_core::Category::Geopolitics,
+        ..Default::default()
+    };
     line("no-fee category", &run(&geo));
 
-    let mut benign = SimConfig::default();
-    benign.informed_fraction = 0.15;
-    benign.flow_per_s = 4.0;
+    let benign = SimConfig {
+        informed_fraction: 0.15,
+        flow_per_s: 4.0,
+        ..Default::default()
+    };
     line("mostly noise flow", &run(&benign));
 
     // ---------------------------------------------------------------
@@ -215,8 +231,10 @@ fn main() {
     const N_SEEDS: u64 = 500;
     let mut pooled = px_score::Scorer::new();
     for i in 0..N_SEEDS {
-        let mut c = SimConfig::default();
-        c.seed = 0x5EED ^ i.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let c = SimConfig {
+            seed: 0x5EED ^ i.wrapping_mul(0x9E37_79B9_7F4A_7C15),
+            ..Default::default()
+        };
         for r in run(&c).scorecard_inputs {
             pooled.record(r);
         }
@@ -254,10 +272,12 @@ fn main() {
         let mut aggr = 0.0;
         const N: u64 = 40;
         for i in 0..N {
-            let mut c = SimConfig::default();
-            c.mode = mode;
-            c.flow_per_s = 4.0;
-            c.seed = 0x5EED ^ i.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            let c = SimConfig {
+                mode,
+                flow_per_s: 4.0,
+                seed: 0x5EED ^ i.wrapping_mul(0x9E37_79B9_7F4A_7C15),
+                ..Default::default()
+            };
             let r = run(&c);
             tot += r.pnl_dollars();
             rew += r.reward_income as f64 / 1e6;
@@ -326,10 +346,12 @@ fn main() {
                 continue;
             }
             let span_s = quotes.last().map(|q| q.t_s).unwrap_or(0.0);
-            let mut cfg = SimConfig::default();
-            cfg.duration_s = span_s;
-            cfg.expiry_s = span_s;
-            cfg.venue_quotes = VenueQuoteSource::Recorded(quotes);
+            let cfg = SimConfig {
+                duration_s: span_s,
+                expiry_s: span_s,
+                venue_quotes: VenueQuoteSource::Recorded(quotes),
+                ..Default::default()
+            };
             let r = run(&cfg);
             for mut f in r.scorecard_inputs {
                 f.forecast.cluster_id = *cluster_id;
@@ -413,8 +435,10 @@ fn main() {
     // internally do what its own config says it does). ---
     println!("\nvenue_lag_s — is the simulator internally consistent with its own knob?");
     {
-        let mut cfg = SimConfig::default();
-        cfg.flow_per_s = 3.0;
+        let cfg = SimConfig {
+            flow_per_s: 3.0,
+            ..Default::default()
+        };
         let measured = run(&cfg).mean_measured_latency_s;
         println!(
             "  configured venue_lag_s: {:.2}s   measured (DenseBook::measured_latency_s, averaged\n  over the run): {:.2}s",
@@ -626,8 +650,10 @@ fn main() {
     {
         let mut all = Vec::new();
         for i in 0..120u64 {
-            let mut c = SimConfig::default();
-            c.seed = 0x5EED ^ i.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            let c = SimConfig {
+                seed: 0x5EED ^ i.wrapping_mul(0x9E37_79B9_7F4A_7C15),
+                ..Default::default()
+            };
             // Tag every forecast with its session so the split cannot leak.
             for mut r in run(&c).scorecard_inputs {
                 r.forecast.horizon_s = i as f64;

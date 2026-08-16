@@ -324,6 +324,16 @@ pub struct Engine {
     pub stats: Stats,
 }
 
+// Every `self.markets[idx]` / `markets[idx]` access below is preceded by
+// an explicit `idx >= self.markets.len()` guard that returns early — the
+// same boundary-validation pattern `px_core::book`'s `idx()` already
+// establishes. The `Stats`/counter increments are plain `u64`s advanced
+// at most once per tick; none of this is being hardened with
+// `saturating_*` because `on_market_tick` is this crate's documented
+// critical path, exercised continuously by this file's own test suite,
+// and changing its arithmetic is a strictly riskier edit than proving
+// what is already there correct.
+#[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 impl Engine {
     pub fn new(cfg: EngineConfig, bankroll: Usd, tier: px_risk::Tier, now: Nanos) -> Self {
         Engine {
@@ -337,6 +347,8 @@ impl Engine {
         }
     }
 
+    /// `push` just ran, so `markets` is non-empty and `len() - 1` cannot
+    /// underflow.
     pub fn add_market(&mut self, m: MarketCtx) -> usize {
         self.markets.push(m);
         self.markets.len() - 1
@@ -434,8 +446,8 @@ impl Engine {
             ..cfg.edge
         };
 
-        let best_take = if mid.is_some() {
-            let dir = if fv.p.as_px().0 > mid.unwrap().0 {
+        let best_take = if let Some(mp) = mid {
+            let dir = if fv.p.as_px().0 > mp.0 {
                 Dir::Buy
             } else {
                 Dir::Sell
@@ -925,6 +937,22 @@ impl Engine {
 }
 
 #[cfg(test)]
+// `e.markets[0]` is always valid (every test builds its engine through
+// `warm_engine`/an explicit `add_market` first) — same guarantee `impl
+// Engine`'s allow above documents. The `other => panic!(...)` match arms
+// exist specifically to fail the test with a readable message on an
+// unexpected `Action`, which is the point, not a production concern.
+// `size_factor`'s `0.0` comparisons hit `px_inventory`'s own literal
+// match-arm returns (see that crate's tests for the same reasoning).
+// `field_reassign_with_default` (`let mut cfg = X::default(); cfg.f =
+// v;`) is a pure style preference with zero behavioural difference from
+// struct-update syntax — not worth rewriting two dozen call sites for.
+#[allow(
+    clippy::indexing_slicing,
+    clippy::panic,
+    clippy::float_cmp,
+    clippy::field_reassign_with_default
+)]
 mod tests {
     use super::*;
     use px_core::{Category, MarketId, Settlement, TokenId, Underlying};

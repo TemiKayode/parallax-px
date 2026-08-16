@@ -430,7 +430,11 @@ pub fn equity_curve(equity: &[f64], label: &str) -> Svg {
         peak = peak.max(e);
         max_dd = max_dd.max(peak - e);
     }
-    if !(hi > lo) {
+    // `hi`/`lo` are folded from `equity`'s real, always-finite samples via
+    // `f64::min`/`f64::max` (mark-to-model equity computed from integer
+    // micro-dollars, never NaN) — a plain `<=` is safe: there is no
+    // incomparable case that could reach this check.
+    if hi <= lo {
         hi = lo + 1.0;
     }
     let span = hi - lo;

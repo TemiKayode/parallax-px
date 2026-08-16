@@ -234,6 +234,11 @@ mod tests {
     }
 
     #[test]
+    // Geopolitics' `taker_rate` is exactly `0.0`, and IEEE 754 guarantees
+    // `0.0 * finite == 0.0` exactly — this is a real invariant, not a
+    // computed value that happens to round to zero, so an exact comparison
+    // is the correct check, not a tolerance one.
+    #[allow(clippy::float_cmp)]
     fn politics_and_sports_rates_match_their_tables() {
         let pol = FeeModel::for_category(Category::Politics);
         assert!((pol.taker_per_share(Px(500_000)) * 100.0 / 1e6 - 1.00).abs() < 1e-6);
@@ -281,6 +286,10 @@ mod tests {
     }
 
     #[test]
+    // `position_score`'s out-of-range branches are explicit `return 0.0;`
+    // paths, not a computation that lands near zero — exact comparison is
+    // the correct check for those three.
+    #[allow(clippy::float_cmp)]
     fn reward_score_is_quadratic_and_cliffs_at_max_spread() {
         let r = RewardModel {
             max_spread_ticks: 3,
@@ -328,6 +337,10 @@ mod tests {
     }
 
     #[test]
+    // `credit_per_share_sec` hits an explicit `return 0.0;` when
+    // `est_total_q <= 0.0` (true of `RewardModel::default()`) — exact by
+    // construction, not a rounding coincidence.
+    #[allow(clippy::float_cmp)]
     fn zero_pool_yields_zero_credit() {
         let r = RewardModel::default();
         assert_eq!(r.credit_per_share_sec(0, Qty::shares(100), true), 0.0);

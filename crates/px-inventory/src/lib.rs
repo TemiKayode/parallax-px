@@ -76,9 +76,14 @@ pub struct Position {
 
 impl Position {
     /// Directional exposure: what actually carries risk.
+    ///
+    /// `Qty` carries no type-level bound (this crate's own tests exercise
+    /// positions up to 500M shares), so this saturates rather than claims
+    /// a caller-supplied bound it cannot enforce — the same discipline
+    /// `apply_fill`'s doc comment already describes for `cost_basis`.
     #[inline(always)]
     pub fn net(&self) -> i64 {
-        self.yes.0 - self.no.0
+        self.yes.0.saturating_sub(self.no.0)
     }
 
     /// Shares held as complete YES+NO sets. Riskless, and mergeable to release
@@ -96,7 +101,7 @@ impl Position {
 
     #[inline(always)]
     pub fn gross(&self) -> i64 {
-        self.yes.0 + self.no.0
+        self.yes.0.saturating_add(self.no.0)
     }
 
     #[inline(always)]
@@ -122,6 +127,10 @@ impl Position {
     /// difference, so anything that cares about complete sets must use this.
     ///
     /// `px` is the price of the leg being traded, not of YES.
+    ///
+    /// Every update here saturates for the same reason `net`/`gross` do —
+    /// `qty`/`cost_basis` have no type-level bound this function can lean
+    /// on.
     pub fn apply_leg(&mut self, leg: Leg, buy: bool, qty: Qty, px: Px) {
         let px = px.clamp_unit();
         if qty.0 <= 0 {
@@ -130,23 +139,23 @@ impl Position {
         let cash = Self::cash(qty.0, px.0);
         match (leg, buy) {
             (Leg::Yes, true) => {
-                self.yes = Qty(self.yes.0 + qty.0);
-                self.cost_basis += cash;
+                self.yes = Qty(self.yes.0.saturating_add(qty.0));
+                self.cost_basis = self.cost_basis.saturating_add(cash);
             }
             (Leg::Yes, false) => {
                 // Cannot sell tokens we do not hold; the venue would reject it.
                 let sold = self.yes.0.min(qty.0);
-                self.yes = Qty(self.yes.0 - sold);
-                self.cost_basis -= Self::cash(sold, px.0);
+                self.yes = Qty(self.yes.0.saturating_sub(sold));
+                self.cost_basis = self.cost_basis.saturating_sub(Self::cash(sold, px.0));
             }
             (Leg::No, true) => {
-                self.no = Qty(self.no.0 + qty.0);
-                self.cost_basis += cash;
+                self.no = Qty(self.no.0.saturating_add(qty.0));
+                self.cost_basis = self.cost_basis.saturating_add(cash);
             }
             (Leg::No, false) => {
                 let sold = self.no.0.min(qty.0);
-                self.no = Qty(self.no.0 - sold);
-                self.cost_basis -= Self::cash(sold, px.0);
+                self.no = Qty(self.no.0.saturating_sub(sold));
+                self.cost_basis = self.cost_basis.saturating_sub(Self::cash(sold, px.0));
             }
         }
     }
@@ -170,6 +179,11 @@ impl Position {
     /// Arithmetic is in `i128`. The old form computed `signed_qty * px` in
     /// `i64`, which overflows above roughly nine million shares — reachable on
     /// a large book, and silent when it happens.
+    ///
+    /// Every update saturates, including the `-signed_qty` negation —
+    /// `i64::MIN` has no positive `i64` counterpart, so a plain unary
+    /// minus on it is itself a real (if exotic) overflow, not a
+    /// theoretical one.
     pub fn apply_fill(&mut self, signed_qty: i64, px: Px) {
         let px = px.clamp_unit();
         if signed_qty == 0 {
@@ -178,26 +192,42 @@ impl Position {
         if signed_qty > 0 {
             // Acquiring YES: first retire any NO we hold, then add YES.
             let retire = self.no.0.min(signed_qty);
-            self.no = Qty(self.no.0 - retire);
-            let open = signed_qty - retire;
-            self.yes = Qty(self.yes.0 + open);
+            self.no = Qty(self.no.0.saturating_sub(retire));
+            let open = signed_qty.saturating_sub(retire);
+            self.yes = Qty(self.yes.0.saturating_add(open));
             // Retiring a NO at price p costs (1 - p); opening YES costs p.
-            self.cost_basis += Self::cash(retire, 1_000_000 - px.0);
-            self.cost_basis += Self::cash(open, px.0);
+            // `px` was clamped to `[0, 1_000_000]` above, so `1_000_000 -
+            // px.0` is provably in the same range — no saturation needed.
+            self.cost_basis = self
+                .cost_basis
+                .saturating_add(Self::cash(retire, 1_000_000i32.saturating_sub(px.0)));
+            self.cost_basis = self.cost_basis.saturating_add(Self::cash(open, px.0));
         } else {
-            let q = -signed_qty;
+            let q = signed_qty.saturating_neg();
             let retire = self.yes.0.min(q);
-            self.yes = Qty(self.yes.0 - retire);
-            let open = q - retire;
-            self.no = Qty(self.no.0 + open);
+            self.yes = Qty(self.yes.0.saturating_sub(retire));
+            let open = q.saturating_sub(retire);
+            self.no = Qty(self.no.0.saturating_add(open));
             // Selling YES at p returns p; opening NO costs (1 - p).
-            self.cost_basis -= Self::cash(retire, px.0);
-            self.cost_basis += Self::cash(open, 1_000_000 - px.0);
+            self.cost_basis = self.cost_basis.saturating_sub(Self::cash(retire, px.0));
+            self.cost_basis = self
+                .cost_basis
+                .saturating_add(Self::cash(open, 1_000_000i32.saturating_sub(px.0)));
         }
     }
 
     /// `qty_micro * price_micro / 1e6`, in i128 so it cannot wrap.
+    ///
+    /// The multiplication itself cannot overflow `i128` for *any* `i64`
+    /// and `i32` input: the largest possible product is
+    /// `i64::MAX * i32::MAX` ≈ 1.98e28, and `i128::MAX` ≈ 1.7e38 — over
+    /// nine orders of magnitude of headroom. The division result cast
+    /// back to `i64` is the one part of this that is not a proven bound
+    /// (an extreme `qty_micro` could still not fit back in `i64`), which
+    /// is why every caller of `cash` combines it with `saturating_add`/
+    /// `saturating_sub` rather than trusting the raw `i64` it returns.
     #[inline(always)]
+    #[allow(clippy::arithmetic_side_effects)]
     fn cash(qty_micro: i64, px_micro: i32) -> i64 {
         ((qty_micro as i128 * px_micro as i128) / 1_000_000) as i64
     }
@@ -205,9 +235,9 @@ impl Position {
     /// Merge matched sets back to collateral, removing them from the book.
     pub fn merge_sets(&mut self) -> Qty {
         let m = self.matched();
-        self.yes = Qty(self.yes.0 - m.0);
-        self.no = Qty(self.no.0 - m.0);
-        self.cost_basis -= m.0;
+        self.yes = Qty(self.yes.0.saturating_sub(m.0));
+        self.no = Qty(self.no.0.saturating_sub(m.0));
+        self.cost_basis = self.cost_basis.saturating_sub(m.0);
         m
     }
 }
@@ -357,8 +387,12 @@ impl InventoryEngine {
         tick: i32,
     ) -> (Px, Px) {
         let w = self.working_price(fair, delta, settle_sd);
-        let bid = Px(w.0 - half_spread).clamp_unit().floor_to_tick(tick);
-        let ask = Px(w.0 + half_spread).clamp_unit().ceil_to_tick(tick);
+        let bid = Px(w.0.saturating_sub(half_spread))
+            .clamp_unit()
+            .floor_to_tick(tick);
+        let ask = Px(w.0.saturating_add(half_spread))
+            .clamp_unit()
+            .ceil_to_tick(tick);
         (bid, ask)
     }
 
@@ -434,7 +468,7 @@ impl InventoryEngine {
 
         if next != self.state {
             self.state = next;
-            self.transitions += 1;
+            self.transitions = self.transitions.saturating_add(1);
         }
     }
 
@@ -442,7 +476,7 @@ impl InventoryEngine {
     pub fn freeze(&mut self) {
         if self.state != InventoryState::Frozen {
             self.state = InventoryState::Frozen;
-            self.transitions += 1;
+            self.transitions = self.transitions.saturating_add(1);
         }
     }
 
@@ -454,7 +488,7 @@ impl InventoryEngine {
             } else {
                 InventoryState::Balanced
             };
-            self.transitions += 1;
+            self.transitions = self.transitions.saturating_add(1);
             self.reevaluate();
         }
     }
@@ -518,6 +552,10 @@ mod tests {
     }
 
     #[test]
+    // A flat position has `net() == 0`, and `penalty_from_model` multiplies
+    // that in as `q = 0.0 / 1e6` — exactly `0.0`, not a rounding
+    // coincidence, since `0.0 * finite == 0.0` under IEEE 754.
+    #[allow(clippy::float_cmp)]
     fn flat_book_has_no_penalty_and_quotes_symmetrically() {
         let e = engine();
         assert_eq!(e.penalty_from_model(0.01, 100.0), 0.0);
@@ -629,6 +667,9 @@ mod tests {
     }
 
     #[test]
+    // `size_factor` returns the literal `0.0` on its `Reducing`/`adds_exposure`
+    // match arm — exact by construction, not a computed value.
+    #[allow(clippy::float_cmp)]
     fn reducing_state_refuses_to_add_exposure() {
         let mut e = engine();
         e.on_fill(Qty::shares(600).0, Px(500_000));
@@ -640,6 +681,9 @@ mod tests {
     }
 
     #[test]
+    // Same as above: `Flattening`/`adds_exposure` is another literal-`0.0`
+    // match arm.
+    #[allow(clippy::float_cmp)]
     fn flattening_state_authorises_crossing() {
         let mut e = engine();
         e.on_fill(Qty::shares(1200).0, Px(500_000));
@@ -649,6 +693,9 @@ mod tests {
     }
 
     #[test]
+    // `Frozen` always returns the literal `0.0`, regardless of
+    // `adds_exposure`.
+    #[allow(clippy::float_cmp)]
     fn freeze_overrides_everything_and_thaw_restores() {
         let mut e = engine();
         e.on_fill(Qty::shares(300).0, Px(500_000));

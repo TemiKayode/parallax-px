@@ -106,6 +106,10 @@ pub fn load_recording(text: &str, market: &str) -> Vec<RecordedQuote> {
 /// time, since every other caller only ever replays one market's
 /// recording against its own start. `pub(crate)` rather than private so
 /// `crate::calibration` can reuse it without duplicating the parser.
+/// `cols.len() != 6` is checked before any of `cols[0]` through
+/// `cols[5]` is read, so every index used below is in range whenever
+/// execution reaches it.
+#[allow(clippy::indexing_slicing)]
 pub(crate) fn parse_quote_rows(text: &str, market: &str) -> Vec<(f64, RecordedQuote)> {
     let mut rows: Vec<(f64, RecordedQuote)> = Vec::new();
     for line in text.lines() {
@@ -148,6 +152,11 @@ pub(crate) fn parse_quote_rows(text: &str, market: &str) -> Vec<(f64, RecordedQu
 /// for the same reason: a resting real quote does not update every tick
 /// either, and treating a gap as "unknown" rather than "unchanged" would
 /// make every polling interval look like a stale-feed condition.
+/// `quotes.is_empty() || ...` short-circuits before `quotes[0]` runs on
+/// an empty slice; `lo`/`hi`/`mid` are a standard binary search staying
+/// within `[0, quotes.len())` throughout — same proof as
+/// `calibration::lookup_value`.
+#[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 pub fn lookup(quotes: &[RecordedQuote], t: f64) -> Option<RecordedQuote> {
     if quotes.is_empty() || t < quotes[0].t_s {
         return None;
@@ -278,6 +287,8 @@ pub fn load_recording_l2(text: &str, market: &str) -> Vec<RecordedBookSnapshot> 
 }
 
 /// Same "hold the last known snapshot forward" semantics as `lookup`.
+/// Same proof as `lookup` above.
+#[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 pub fn lookup_l2(snapshots: &[RecordedBookSnapshot], t: f64) -> Option<&RecordedBookSnapshot> {
     if snapshots.is_empty() || t < snapshots[0].t_s {
         return None;
@@ -374,6 +385,11 @@ pub fn set_complementary_book_from_quote(book: &mut DenseBook, q: RecordedQuote)
 /// quote at or before it (same "hold forward" semantics as `lookup`). A
 /// `no_market` snapshot with nothing in `yes_market` yet to compare
 /// against is skipped, not treated as zero error.
+///
+/// `yes_rows.is_empty() || ...` short-circuits before indexing on an
+/// empty slice; the inner `lo`/`hi`/`mid` walk is the same bounded
+/// binary search as `lookup`.
+#[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 pub fn complementarity_error(text: &str, yes_market: &str, no_market: &str) -> Vec<(f64, f64)> {
     let yes_rows = parse_quote_rows(text, yes_market);
     let no_rows = parse_quote_rows(text, no_market);
@@ -403,6 +419,9 @@ pub fn complementarity_error(text: &str, yes_market: &str, no_market: &str) -> V
 }
 
 #[cfg(test)]
+// Test-only: a wrong index or an unwrap on `None` is the test failing,
+// which is the correct, intended outcome here.
+#[allow(clippy::indexing_slicing, clippy::unwrap_used)]
 mod tests {
     use super::*;
 

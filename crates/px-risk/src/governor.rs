@@ -210,6 +210,9 @@ impl QuoteGovernor {
         now: Nanos,
         urgent: bool,
     ) -> RequoteVerdict {
+        // `desired.0`/`current.0` are `Px`, bounded to `[0, 1_000_000]` —
+        // the difference is well inside `i32`.
+        #[allow(clippy::arithmetic_side_effects)]
         let moved = (desired.0 - current.0).abs() / tick.max(1);
         if !urgent && moved < self.min_requote_ticks {
             return RequoteVerdict::NotWorthIt;
@@ -250,7 +253,7 @@ impl QuoteGovernor {
     /// Commit a batch of new orders (the venue charges one token per order).
     pub fn commit_batch(&mut self, n: usize, now: Nanos) -> bool {
         if self.orders.try_take(n as f64, now) {
-            self.live_orders += n as u32;
+            self.live_orders = self.live_orders.saturating_add(n as u32);
             true
         } else {
             false
@@ -290,6 +293,10 @@ mod tests {
     }
 
     #[test]
+    // `refill` clamps `tokens` with `.min(self.burst)`; after a 100s gap the
+    // sum term is far past `burst`, so `.min` returns `burst` (`60.0`)
+    // exactly, not a computed value that happens to land there.
+    #[allow(clippy::float_cmp)]
     fn bucket_never_exceeds_burst() {
         let mut b = TokenBucket::new(40.0, 60.0, false, Nanos::ZERO);
         assert_eq!(b.available(Nanos::from_millis(100_000)), 60.0);
@@ -312,6 +319,10 @@ mod tests {
     }
 
     #[test]
+    // `wait_for(0.0, ..)` hits `if self.tokens >= n { 0.0 }` — `tokens`
+    // (>=0 after any refill) is always `>= 0.0`, so this is the literal
+    // branch, not a computed value.
+    #[allow(clippy::float_cmp)]
     fn wait_for_reports_the_right_delay() {
         let mut b = TokenBucket::new(40.0, 60.0, false, Nanos::ZERO);
         b.try_take(60.0, Nanos::ZERO);
@@ -394,6 +405,11 @@ mod tests {
     }
 
     #[test]
+    // `before`/the final `available()` call are the same bucket in
+    // identical state (nothing consumes a token across 50 failed
+    // attempts, which is the property under test) — bit-identical
+    // computation, not a coincidental rounding match.
+    #[allow(clippy::float_cmp)]
     fn a_failed_requote_does_not_leak_a_cancel_token() {
         // Regression: `cancels.try_take() && orders.try_take()` short-circuits.
         // When the order bucket was empty the cancel token was already spent and

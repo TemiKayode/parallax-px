@@ -30,6 +30,12 @@ pub fn observed_half_spreads(quotes: &[RecordedQuote]) -> Vec<f64> {
 /// trailing window and are skipped, not zero-padded — a padded zero
 /// would understate the real spread of this distribution for no reason
 /// other than list length.
+/// The guard above (`window == 0 || quotes.len() <= window`) means every
+/// arithmetic and indexing operation below runs only once `quotes.len() >
+/// window > 0` is established: `mids.len() - window` cannot underflow,
+/// `i - window` is `>= 0` since `i >= window` throughout the loop, and
+/// `mids[start..i]`/`mids[i]` index only positions `< mids.len()`.
+#[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 pub fn observed_noise(quotes: &[RecordedQuote], window: usize) -> Vec<f64> {
     if window == 0 || quotes.len() <= window {
         return Vec::new();
@@ -62,6 +68,9 @@ pub fn mean_std(values: &[f64]) -> Option<(f64, f64)> {
 /// `None` if the lengths differ, there are fewer than 2 points, or
 /// either series has zero variance — a flat series has an undefined
 /// correlation with anything, not a zero one.
+/// `a.len() == b.len()` is checked above, so indexing both with `i in
+/// 0..a.len()` is in range for both by construction.
+#[allow(clippy::indexing_slicing)]
 pub fn correlation(a: &[f64], b: &[f64]) -> Option<f64> {
     if a.len() != b.len() || a.len() < 2 {
         return None;
@@ -89,6 +98,12 @@ pub fn correlation(a: &[f64], b: &[f64]) -> Option<f64> {
 /// `recording::lookup`, generalised to a plain `(t_unix, value)` series
 /// so it works for a reference-price capture too, not just
 /// `RecordedQuote`s.
+/// `series.is_empty() || ...` short-circuits before `series[0]` is ever
+/// evaluated on an empty slice. `lo`/`hi` are a standard binary search
+/// over `series`'s real length — `series.len()` would need to approach
+/// `usize::MAX` for `lo + hi` to overflow, and `mid` stays within
+/// `[lo, hi) ⊆ [0, series.len())` throughout.
+#[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 fn lookup_value(series: &[(f64, f64)], t: f64) -> Option<f64> {
     if series.is_empty() || t < series[0].0 {
         return None;
@@ -122,6 +137,10 @@ fn lookup_value(series: &[(f64, f64)], t: f64) -> Option<f64> {
 /// requested lag; `None` where there were fewer than 2 usable pairs at
 /// that lag (a lag reaching before the reference series' first sample,
 /// most commonly).
+/// `w[0]`/`w[1]` below: `Slice::windows(2)` guarantees every yielded slice
+/// has exactly 2 elements, never fewer — both indices are always in
+/// range by that contract.
+#[allow(clippy::indexing_slicing)]
 pub fn lag_correlation(
     reference: &[(f64, f64)],
     venue: &[(f64, f64)],
@@ -162,6 +181,10 @@ pub fn venue_mid_series(text: &str, market: &str) -> Vec<(f64, f64)> {
 }
 
 #[cfg(test)]
+// Test-only: an index or unwrap that would be wrong is exactly the test
+// failing, which is the correct and intended outcome — not a production
+// safety concern.
+#[allow(clippy::indexing_slicing, clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::recording::RecordedQuote;

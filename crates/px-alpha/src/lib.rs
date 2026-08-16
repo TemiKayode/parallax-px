@@ -81,6 +81,12 @@ pub struct RefState {
     pub adjusted: [f64; N],
 }
 
+// Every array field on `RefState` (`vol`/`spot`/`spot_ts`/`adjusted`) is
+// declared `[_; N]`, and every method below either guards `asset < N`
+// explicitly before indexing with it (`on_print`, `age`) or loops `0..N`
+// (`on_clock`) — the same fixed-size proof `cross.rs`'s `impl CrossAsset`
+// already relies on.
+#[allow(clippy::indexing_slicing, clippy::needless_range_loop)]
 impl RefState {
     pub fn new() -> Self {
         RefState {
@@ -94,7 +100,8 @@ impl RefState {
 
     /// Reference feed tick.
     pub fn on_print(&mut self, asset: usize, price: f64, ts_s: f64) {
-        if asset >= N || !(price > 0.0) || !price.is_finite() {
+        // `!price.is_finite()` already rejects NaN.
+        if asset >= N || price <= 0.0 || !price.is_finite() {
             return;
         }
         self.vol[asset].update(price, ts_s);
@@ -187,6 +194,13 @@ impl Default for TwapAwareModel {
     }
 }
 
+// `spec.underlying.index()` is `px_core::Underlying::index()`, which maps
+// each of that enum's exactly 7 variants to `0..7` — and `N` (from
+// `cross.rs`) is that same `7`, documented there as "one slot per
+// `px_core::Underlying`". Every `refs.spot[a]`/`refs.vol[a]`/
+// `refs.adjusted[a]` below indexes with that value, always in bounds by
+// this cross-crate structural relationship.
+#[allow(clippy::indexing_slicing)]
 impl FairModel for TwapAwareModel {
     fn name(&self) -> &'static str {
         "twap-aware-v1"
@@ -280,6 +294,12 @@ impl core::fmt::Debug for ModelRegistry {
     }
 }
 
+// `models` only ever grows (`new` seeds one, `register` pushes one — there
+// is no removal method), so `models.len() - 1` right after a `push` cannot
+// underflow, and `active` is only ever set by `activate`'s own
+// `idx < self.models.len()` guard (or `0`, valid because `new` never
+// constructs an empty `models`) — so indexing by it is always in bounds.
+#[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 impl ModelRegistry {
     pub fn new(initial: Box<dyn FairModel>) -> Self {
         ModelRegistry {
@@ -329,6 +349,8 @@ impl ModelRegistry {
 }
 
 #[cfg(test)]
+// Same `[_; N]` / `0..N` bound as `impl RefState` above.
+#[allow(clippy::indexing_slicing, clippy::needless_range_loop)]
 mod tests {
     use super::*;
     use px_core::{Category, MarketId, Qty, TokenId, Underlying};
@@ -413,6 +435,10 @@ mod tests {
     }
 
     #[test]
+    // `tau_secs` is `self.expiry.since(now).as_secs_f64()`, and `Nanos::since`
+    // saturates to exactly `Nanos::ZERO` once expired (see its own doc
+    // comment) — `0.0`, not a rounding coincidence.
+    #[allow(clippy::float_cmp)]
     fn expired_market_is_not_usable() {
         let m = TwapAwareModel::default();
         let refs = warm_refs(65_000.0);

@@ -34,7 +34,7 @@ use px_core::{Px, Qty, Usd};
 #[inline]
 pub fn kelly_fraction(p: f64, entry: Px) -> f64 {
     let c = entry.as_f64();
-    if !(c > 0.0 && c < 1.0) || !p.is_finite() {
+    if !(c > 0.0 && c < 1.0 && p.is_finite()) {
         return 0.0;
     }
     let f = (p - c) / (1.0 - c);
@@ -92,6 +92,10 @@ mod tests {
     use super::*;
 
     #[test]
+    // Both calls land on `kelly_fraction`'s `else { 0.0 }` branch (f == 0.0
+    // exactly for p=0.50/c=0.50, f < 0.0 for p=0.40/c=0.50) — a literal,
+    // not a rounding coincidence.
+    #[allow(clippy::float_cmp)]
     fn no_edge_means_no_bet() {
         assert_eq!(kelly_fraction(0.50, Px(500_000)), 0.0);
         assert_eq!(kelly_fraction(0.40, Px(500_000)), 0.0);
@@ -172,6 +176,9 @@ mod tests {
     }
 
     #[test]
+    // The fee-adjusted price pushes `f <= 0.0`, hitting the same literal
+    // `else { 0.0 }` branch as `no_edge_means_no_bet`.
+    #[allow(clippy::float_cmp)]
     fn a_fee_can_erase_the_bet_entirely() {
         // Fair 53c against a 52c offer looks like edge until the fee is added.
         let net = kelly_fraction_after_fee(0.53, Px(520_000), 17_472.0);
@@ -203,6 +210,10 @@ mod tests {
     }
 
     #[test]
+    // `Px::ZERO`/`Px::ONE` fail the `c > 0.0 && c < 1.0` guard, and `NAN`
+    // fails `p.is_finite()` — all three hit `kelly_fraction`'s explicit
+    // `return 0.0;`, not a computed value.
+    #[allow(clippy::float_cmp)]
     fn degenerate_prices_are_handled() {
         assert_eq!(kelly_fraction(0.9, Px::ZERO), 0.0);
         assert_eq!(kelly_fraction(0.9, Px::ONE), 0.0);

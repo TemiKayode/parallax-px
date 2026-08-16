@@ -51,7 +51,8 @@ impl EwmaVol {
 
     /// Feed a new reference print. `ts` is seconds on the monotonic timebase.
     pub fn update(&mut self, price: f64, ts: f64) {
-        if !(price > 0.0) || !price.is_finite() {
+        // `!price.is_finite()` already rejects NaN.
+        if price <= 0.0 || !price.is_finite() {
             return; // Reject nonsense outright; the feed guard will notice.
         }
         if !self.initialised {
@@ -415,6 +416,10 @@ mod tests {
     }
 
     #[test]
+    // Every rejected `update` call returns before touching any field, so
+    // `sigma_rel()` is computed from bit-identical state — the same
+    // computation twice, not a coincidental rounding match.
+    #[allow(clippy::float_cmp)]
     fn ewma_rejects_nonsense_prices() {
         let mut v = EwmaVol::new(30.0);
         v.update(65_000.0, 1.0);
@@ -446,6 +451,9 @@ mod tests {
     }
 
     #[test]
+    // A fresh `EwmaVol` has `n_eff == 0.0 < 2.0`, which `rel_err` handles
+    // with an explicit `return 1.0` — exact by construction.
+    #[allow(clippy::float_cmp)]
     fn rel_err_falls_as_samples_accumulate() {
         let mut v = EwmaVol::new(60.0);
         assert_eq!(v.rel_err(), 1.0);
@@ -595,6 +603,12 @@ mod tests {
     }
 
     #[test]
+    // A print before the window (`ts <= self.start`) makes `update` set
+    // `last_t = self.start` exactly, so `elapsed_fraction`'s
+    // `(last_t - start) / w` is exactly `0.0`; `observed_avg` then takes
+    // its `elapsed <= 0.0` branch and returns `last_px` — the literal
+    // input price, no arithmetic at all. Both exact by construction.
+    #[allow(clippy::float_cmp)]
     fn twap_accumulator_before_window_returns_last_price() {
         let mut a = TwapAccumulator::new(300.0, 60.0);
         a.update(64_900.0, 10.0);

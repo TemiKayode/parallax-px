@@ -92,6 +92,11 @@ pub struct FeedHealth {
     recovery_count: u32,
 }
 
+// `last_seen`/`max_age` are both declared `[_; 4]`, and `Feed::index()`
+// is an exhaustive match over `Feed`'s own 4 variants mapping each to
+// `0..4` — every index used below comes from that method, so it is
+// always in bounds by construction.
+#[allow(clippy::indexing_slicing)]
 impl FeedHealth {
     pub fn new(now: Nanos) -> Self {
         FeedHealth {
@@ -144,7 +149,7 @@ impl FeedHealth {
             // Feeds look fine, but a sticky fault needs sustained health before
             // we trust it again. Flapping back into the market the instant a
             // gap closes is how a resync bug becomes a position.
-            self.recovery_count += 1;
+            self.recovery_count = self.recovery_count.saturating_add(1);
             if self.recovery_count >= self.recovery_required {
                 self.fault = FaultKind::None;
                 self.recovery_count = 0;
@@ -222,10 +227,10 @@ impl RareLossGuard {
     /// Record a settled near-resolution trade.
     pub fn observe(&mut self, lost: bool) {
         let inc = if lost {
-            self.losses += 1;
+            self.losses = self.losses.saturating_add(1);
             px_core::math::ln(self.p1 / self.p0)
         } else {
-            self.wins += 1;
+            self.wins = self.wins.saturating_add(1);
             px_core::math::ln((1.0 - self.p1) / (1.0 - self.p0))
         };
         self.log_lr += inc;
@@ -336,6 +341,10 @@ pub struct ExposureBook {
     turnover: i64,
 }
 
+// Every `[bucket]`/`[b]` access below is behind an explicit `bucket <
+// BUCKETS` (or `b < BUCKETS`) guard — provably in range, the same pattern
+// `px_core::book`'s `idx()`-guarded indexing already establishes.
+#[allow(clippy::indexing_slicing)]
 impl ExposureBook {
     pub fn new() -> Self {
         ExposureBook::default()
@@ -346,14 +355,16 @@ impl ExposureBook {
         if bucket < BUCKETS {
             self.bucket[bucket] = self.bucket[bucket].saturating_add(signed_notional);
         }
-        self.turnover = self.turnover.saturating_add(signed_notional.abs());
+        self.turnover = self
+            .turnover
+            .saturating_add(signed_notional.saturating_abs());
     }
 
     /// Reserve headroom for an order that has been approved but not filled.
     #[inline]
     pub fn reserve(&mut self, bucket: usize, notional: i64) {
         if bucket < BUCKETS {
-            self.reserved[bucket] = self.reserved[bucket].saturating_add(notional.abs());
+            self.reserved[bucket] = self.reserved[bucket].saturating_add(notional.saturating_abs());
         }
     }
 
@@ -362,7 +373,9 @@ impl ExposureBook {
     #[inline]
     pub fn release(&mut self, bucket: usize, notional: i64) {
         if bucket < BUCKETS {
-            self.reserved[bucket] = (self.reserved[bucket] - notional.abs()).max(0);
+            self.reserved[bucket] = self.reserved[bucket]
+                .saturating_sub(notional.saturating_abs())
+                .max(0);
         }
     }
 
@@ -423,6 +436,19 @@ impl ExposureBook {
         let dof = effective_dof.clamp(1.0, n_assets.max(1.0));
         Usd((base.0 as f64 * (dof / n_assets.max(1.0)).sqrt()) as i64)
     }
+}
+
+/// `qty_micro * price_micro / 1e6`, in i128 so it cannot wrap — same
+/// helper `px_inventory::Position::cash` already establishes for the
+/// identical shape. The multiplication cannot overflow `i128` for any
+/// `i64`/`i32` input (`i64::MAX * i32::MAX` ≈ 1.98e28, far under
+/// `i128::MAX` ≈ 1.7e38); the cast back to `i64` is not similarly proven,
+/// which is why every caller feeds the result into a `saturating_*`
+/// exposure update rather than trusting it directly.
+#[inline(always)]
+#[allow(clippy::arithmetic_side_effects)]
+fn notional_micro(qty_micro: i64, price_micro: i32) -> i64 {
+    (qty_micro as i128 * price_micro as i128 / 1_000_000) as i64
 }
 
 /// The verdict on a proposed trade.
@@ -529,7 +555,10 @@ impl RiskGate {
         if equity > self.peak_equity {
             self.peak_equity = equity;
         }
-        if self.peak_equity - equity >= self.limits.max_drawdown.0 {
+        // `peak_equity >= equity` always holds here: either this equity
+        // just became the new peak, or the check above left it unchanged
+        // because it was already `>=`.
+        if self.peak_equity.saturating_sub(equity) >= self.limits.max_drawdown.0 {
             self.drawdown_halt = true;
             self.health.fault(FaultKind::LossLimit);
         }
@@ -537,7 +566,9 @@ impl RiskGate {
 
     #[inline(always)]
     pub fn drawdown(&self) -> i64 {
-        self.peak_equity - self.last_equity
+        // `peak_equity >= last_equity` is an invariant of every
+        // `observe_equity` call — same reasoning as there.
+        self.peak_equity.saturating_sub(self.last_equity)
     }
 
     #[inline(always)]
@@ -580,7 +611,11 @@ impl RiskGate {
         let mut reduced = q != req.want;
 
         // --- Per-market capital ---
-        let room_micro = self.limits.max_capital_per_market.0 - req.existing_capital;
+        let room_micro = self
+            .limits
+            .max_capital_per_market
+            .0
+            .saturating_sub(req.existing_capital);
         if room_micro <= 0 {
             return Verdict::Rejected(RejectReason::MarketCapital);
         }
@@ -592,7 +627,10 @@ impl RiskGate {
         }
 
         // --- Unhedged share cap ---
-        let headroom = self.limits.max_unhedged_shares - req.existing_net.abs();
+        let headroom = self
+            .limits
+            .max_unhedged_shares
+            .saturating_sub(req.existing_net.saturating_abs());
         if headroom <= 0 {
             return Verdict::Rejected(RejectReason::UnhedgedShares);
         }
@@ -602,8 +640,12 @@ impl RiskGate {
         }
 
         // --- Correlation bucket ---
-        let bucket_used = self.exposure.bucket_exposure(req.bucket).abs();
-        let bucket_room = self.limits.max_bucket_exposure.0 - bucket_used;
+        let bucket_used = self.exposure.bucket_exposure(req.bucket).saturating_abs();
+        let bucket_room = self
+            .limits
+            .max_bucket_exposure
+            .0
+            .saturating_sub(bucket_used);
         if bucket_room <= 0 {
             return Verdict::Rejected(RejectReason::BucketExposure);
         }
@@ -619,7 +661,7 @@ impl RiskGate {
             self.effective_dof,
             self.n_assets,
         );
-        let gross_room = gross_limit.0 - self.exposure.gross();
+        let gross_room = gross_limit.0.saturating_sub(self.exposure.gross());
         if gross_room <= 0 {
             return Verdict::Rejected(RejectReason::GrossExposure);
         }
@@ -652,7 +694,7 @@ impl RiskGate {
         // because neither has filled yet. Both get approved, both fill, and the
         // bucket limit is breached by up to a factor of the number of markets
         // sharing it. The reservation is released by `on_fill` or `on_reject`.
-        let notional = (q.0 as i128 * req.entry.0 as i128 / 1_000_000) as i64;
+        let notional = notional_micro(q.0, req.entry.0);
         self.exposure.reserve(req.bucket, notional);
 
         if reduced {
@@ -665,7 +707,7 @@ impl RiskGate {
     /// Record an executed trade against the exposure book, releasing the
     /// reservation the gate took when it approved the order.
     pub fn on_fill(&mut self, bucket: usize, signed_qty: i64, px: Px) {
-        let notional = (signed_qty as i128 * px.0 as i128 / 1_000_000) as i64;
+        let notional = notional_micro(signed_qty, px.0);
         self.exposure.release(bucket, notional);
         self.exposure.add(bucket, notional);
     }
@@ -673,7 +715,7 @@ impl RiskGate {
     /// An approved order died without filling. Release its reservation, or the
     /// headroom leaks and the gate tightens for no reason.
     pub fn on_reject(&mut self, bucket: usize, qty: Qty, px: Px) {
-        let notional = (qty.0 as i128 * px.0 as i128 / 1_000_000) as i64;
+        let notional = notional_micro(qty.0, px.0);
         self.exposure.release(bucket, notional);
     }
 
@@ -714,13 +756,24 @@ impl RiskGate {
 
         let mut cap = i64::MAX;
 
-        let market_room = self.limits.max_capital_per_market.0 - existing_capital;
+        let market_room = self
+            .limits
+            .max_capital_per_market
+            .0
+            .saturating_sub(existing_capital);
         cap = cap.min(((market_room.max(0) as f64) / px) as i64);
 
-        let share_room = self.limits.max_unhedged_shares - existing_net.abs();
+        let share_room = self
+            .limits
+            .max_unhedged_shares
+            .saturating_sub(existing_net.saturating_abs());
         cap = cap.min(share_room.max(0));
 
-        let bucket_room = self.limits.max_bucket_exposure.0 - self.exposure.bucket_exposure(bucket);
+        let bucket_room = self
+            .limits
+            .max_bucket_exposure
+            .0
+            .saturating_sub(self.exposure.bucket_exposure(bucket));
         cap = cap.min(((bucket_room.max(0) as f64) / px) as i64);
 
         let gross_limit = ExposureBook::effective_gross_limit(
@@ -728,7 +781,7 @@ impl RiskGate {
             self.effective_dof,
             self.n_assets,
         );
-        let gross_room = gross_limit.0 - self.exposure.gross();
+        let gross_room = gross_limit.0.saturating_sub(self.exposure.gross());
         cap = cap.min(((gross_room.max(0) as f64) / px) as i64);
 
         Qty(cap.max(0))

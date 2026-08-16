@@ -394,6 +394,10 @@ mod tests {
     }
 
     #[test]
+    // `tau == 0.0` collapses `sd` to exactly `0.0`, which `fair` handles
+    // with an explicit `p = if mean > strike { 1.0 } else { 0.0 }` — a
+    // literal, not a computed value.
+    #[allow(clippy::float_cmp)]
     fn expired_market_is_decided() {
         let mut inp = base();
         inp.tau = 0.0;

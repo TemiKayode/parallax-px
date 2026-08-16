@@ -850,10 +850,10 @@ mod tests {
     #[test]
     fn measured_latency_matches_the_gap_between_now_and_exch_ts() {
         let mut b = DenseBook::new(10_000);
-        b.exch_ts_ms = 4_500; // 4.5s
+        b.exch_ts_ms = 4_500; // 4.5s, exactly representable, so an exact
+                              // comparison below is not a precision risk.
                               // 10.0s "now" minus a 4.5s-old update is 5.5s of measured latency.
-        let lat = b.measured_latency_s(10.0).unwrap();
-        assert!((lat - 5.5).abs() < 1e-9, "lat={lat}");
+        assert_eq!(b.measured_latency_s(10.0), Some(5.5));
     }
 
     #[test]

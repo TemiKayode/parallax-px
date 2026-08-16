@@ -105,27 +105,30 @@ in `exp` reachable through `norm_pdf` in the TWAP endgame, a NaN that failed
 *open* into zero safety margin, and an aggressive-churn loop that crossed 1.2
 million shares against 48,000 filled passively.
 
-**Clippy and `cargo fmt`, honestly.** `px-core` — the crate everything else in
-the workspace depends on — is now fully clean: `cargo clippy -p px-core
---all-targets -- -D warnings` and `cargo fmt --check` on every file in it both
-pass, including fixing a genuine rustfmt performance pathology in `exp`'s
-Horner-form polynomial (restructured into an equivalent loop, verified
-bit-exact against the existing test suite, not just reformatted around). The
-rest of the workspace (`px-alpha`, `px-edge`, `px-inventory`, `px-selector`,
-`px-risk`, and most of `px-engine`'s own pre-existing code) still does not
-pass `cargo clippy --workspace --all-targets -- -D warnings` on this toolchain
-(rustc/clippy 1.96.0) — several hundred more `clippy::indexing_slicing` /
-`clippy::arithmetic_side_effects` / `clippy::needless_range_loop` diagnostics,
-present on the very first commit of this repo, before any work in this repo
-touched them. Almost certainly toolchain-version drift from whenever this was
-originally validated clean, not a regression — `cargo build`/`cargo test
---workspace` both pass without warnings regardless, and every file actually
-touched in this repo's work (`px-score`, `px-plot`, and the specific files
-changed in `px-engine`) was separately verified clippy-clean by temporarily
-holding the upstream crates' blocking lints aside for the check. Fully fixing
-`px-alpha` etc. is real, substantial, separate work — scoped out here rather
-than either quietly ignored or rushed through without the same bit-exactness
-care `px-core`'s fix required.
+**Clippy and `cargo fmt`, honestly.** The whole workspace is clean:
+`cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --check`
+both pass on every crate, verified on a `cargo clean` build so no stale
+fingerprint could be hiding a false negative — CI runs the same two commands
+on every push. This was not always true. `px-core`, the crate everything else
+depends on, was fixed first, including a genuine rustfmt performance
+pathology in `exp`'s Horner-form polynomial (restructured into an equivalent
+loop, verified bit-exact against the existing test suite, not just
+reformatted around). The rest of the workspace — `px-alpha`, `px-edge`,
+`px-inventory`, `px-risk`, `px-selector`, and `px-engine` — carried several
+hundred more `clippy::indexing_slicing` / `clippy::arithmetic_side_effects` /
+`clippy::needless_range_loop` findings, some pre-existing and some introduced
+by this repo's own later work, that a `cargo clippy`/`cargo test` caching
+interaction had been silently hiding from every check run in between. Fixed
+in proportion to what each site actually needed, not uniformly: a scoped
+`#[allow]` with a bounds-justification comment where the index or arithmetic
+is genuinely provable (a guard just above, a binary search, a fixed-size
+array matched to a compile-time constant — the same pattern `px_core::book`'s
+`idx()` already established), or real hardening with `saturating_*` where the
+value has no such bound (`Qty`/notional arithmetic, simple counters). The one
+exception is `px-engine`'s `Engine::on_market_tick` and `replay::run` — this
+crate's tested, bit-exact critical path — where retrofitting `saturating_*`
+throughout would have been a strictly riskier edit than proving the existing
+arithmetic already correct, so those are proven, not hardened.
 
 ### What changed since the 248-test snapshot
 

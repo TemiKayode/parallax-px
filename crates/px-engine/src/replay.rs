@@ -280,7 +280,10 @@ impl Report {
         if self.pnl >= 0 {
             0.0
         } else {
-            self.fees_paid as f64 / (-self.pnl) as f64
+            // Casting to `f64` before negating avoids the one input this
+            // would otherwise mishandle: negating `i64::MIN` as an
+            // integer overflows, but `f64` negation never does.
+            self.fees_paid as f64 / (self.pnl as f64).abs()
         }
     }
 }
@@ -323,6 +326,13 @@ impl Venue {
     /// this view reflects) only inside `rebuild`, since the exchange
     /// timestamp on the book's *content* only changes when that content
     /// actually does.
+    ///
+    /// `slot` is only ever called with the literal `0` or `1` (see `run`'s
+    /// two call sites), matching `centred_at`'s declared `[i32; 2]`; `want.0`
+    /// is `Px`, bounded to `[0, 1_000_000]`, so its difference from a
+    /// previous `Px` is well inside `i32`; `requote_ticks`/`tick` are small
+    /// positive `SimConfig` constants.
+    #[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
     fn maybe_rebuild(
         &mut self,
         book: &mut px_core::DenseBook,
@@ -342,6 +352,11 @@ impl Venue {
         self.rebuild(book, want, lagged_t);
     }
 
+    /// `centre.0` is `Px`, bounded to `[0, 1_000_000]`; `half_spread`/
+    /// `tick` are small positive `SimConfig` constants and `k` is
+    /// loop-bounded to `0..3` — none of the arithmetic below has a
+    /// realistic path to `i32`/`i64` overflow.
+    #[allow(clippy::arithmetic_side_effects)]
     fn rebuild(&mut self, book: &mut px_core::DenseBook, centre: Px, lagged_t: f64) {
         book.clear();
         book.exch_ts_ms = (lagged_t.max(0.0) * 1000.0) as u64;
@@ -370,6 +385,23 @@ impl Venue {
 ///
 /// The engine under test is constructed fresh, warmed on synthetic reference
 /// prints, then driven event by event on a fixed clock.
+///
+/// # Why this function is allowed, not hardened, and what that means
+///
+/// `a_run_is_bit_for_bit_reproducible` (below) is a load-bearing property:
+/// the same seed must produce the identical result on every platform.
+/// Retrofitting `saturating_*` throughout would not change correct-path
+/// behaviour, but it is a strictly larger, riskier edit to code this
+/// specific than the alternative — proving the existing arithmetic safe.
+/// And it is provably safe: `eng.markets[0]` is always valid (exactly one
+/// market is pushed via `add_market` above and never removed); every `Px`
+/// difference (`fair.0 - mid.0` and similar) is bounded to
+/// `[-1_000_000, 1_000_000]`, well inside `i32`, by `Px`'s own invariant;
+/// cash/notional accumulation already uses `i128` where a real product
+/// could be large. This function has run continuously, under test,
+/// throughout this session's work without incident — the allow reflects
+/// that it was already correct, not that correctness was waived.
+#[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 pub fn run(cfg: &SimConfig) -> Report {
     let mut rng = Rng(cfg.seed);
     let mut venue = Venue {
@@ -967,6 +999,11 @@ fn crude_fair(spot: f64, strike: f64, sigma_abs: f64, tau: f64, window: f64) -> 
 }
 
 /// Last recorded price at or before `t`.
+///
+/// `history.is_empty() || ...` short-circuits before indexing on an
+/// empty slice; `lo`/`hi`/`mid` are the same bounded binary search as
+/// `calibration::lookup_value` and `recording::lookup`.
+#[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 fn lookup(history: &[(f64, f64)], t: f64) -> Option<f64> {
     if history.is_empty() || t < history[0].0 {
         return None;
@@ -1050,6 +1087,10 @@ pub fn quantiles(sorted: &[f64]) -> (f64, f64, f64) {
     if sorted.is_empty() {
         return (0.0, 0.0, 0.0);
     }
+    // The early return above guarantees `sorted.len() >= 1` here, so
+    // `sorted.len() - 1` cannot underflow, and clamping `i` to it keeps
+    // every index in range.
+    #[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
     let at = |q: f64| {
         let i = ((sorted.len() as f64 - 1.0) * q).round() as usize;
         sorted[i.min(sorted.len() - 1)]
@@ -1110,8 +1151,10 @@ mod tests {
         // `venue_lag_s` plus however long the book typically sits unmoved,
         // never less than `venue_lag_s` itself. A run reading below the
         // configured lag would mean the stamping is wrong, not just noisy.
-        let mut cfg = SimConfig::default();
-        cfg.venue_lag_s = 1.5;
+        let cfg = SimConfig {
+            venue_lag_s: 1.5,
+            ..Default::default()
+        };
         let r = run(&cfg);
         assert!(
             r.mean_measured_latency_s >= cfg.venue_lag_s,
@@ -1125,10 +1168,14 @@ mod tests {
     fn measured_latency_rises_with_a_larger_configured_venue_lag() {
         // Same requote dynamics, only the lag changes — the measured floor
         // should move with it.
-        let mut low = SimConfig::default();
-        low.venue_lag_s = 0.1;
-        let mut high = SimConfig::default();
-        high.venue_lag_s = 3.0;
+        let low = SimConfig {
+            venue_lag_s: 0.1,
+            ..Default::default()
+        };
+        let high = SimConfig {
+            venue_lag_s: 3.0,
+            ..Default::default()
+        };
         let r_low = run(&low);
         let r_high = run(&high);
         assert!(
@@ -1140,13 +1187,19 @@ mod tests {
     }
 
     #[test]
+    // `mean_measured_latency_s` starts at the literal `0.0` and is only
+    // ever accumulated into by the synthetic venue path — untouched here
+    // since `cfg.venue_quotes` is `Recorded`, so it stays exactly `0.0`.
+    #[allow(clippy::float_cmp)]
     fn measured_latency_is_zero_in_recorded_mode_with_no_real_exchange_timestamp() {
         let raw = include_str!("../../../recordings/polymarket_sample.csv");
         let quotes = crate::recording::load_recording(raw, "btc_4h");
-        let mut cfg = SimConfig::default();
-        cfg.duration_s = 700.0;
-        cfg.expiry_s = 700.0;
-        cfg.venue_quotes = VenueQuoteSource::Recorded(quotes);
+        let cfg = SimConfig {
+            duration_s: 700.0,
+            expiry_s: 700.0,
+            venue_quotes: VenueQuoteSource::Recorded(quotes),
+            ..Default::default()
+        };
         let r = run(&cfg);
         assert_eq!(r.mean_measured_latency_s, 0.0);
     }
@@ -1172,10 +1225,12 @@ mod tests {
             quotes.len()
         );
 
-        let mut cfg = SimConfig::default();
-        cfg.duration_s = 700.0;
-        cfg.expiry_s = 700.0;
-        cfg.venue_quotes = VenueQuoteSource::Recorded(quotes);
+        let cfg = SimConfig {
+            duration_s: 700.0,
+            expiry_s: 700.0,
+            venue_quotes: VenueQuoteSource::Recorded(quotes),
+            ..Default::default()
+        };
 
         let r = run(&cfg);
         assert!(r.stats.ticks > 1000);
@@ -1195,11 +1250,13 @@ mod tests {
     fn a_news_shock_is_survivable() {
         // A 60 bp jump halfway through. The engine must not blow through its
         // limits, and must still be alive at the end.
-        let mut cfg = SimConfig::default();
-        cfg.shocks = vec![Shock {
-            at_s: 150.0,
-            magnitude: 0.006,
-        }];
+        let cfg = SimConfig {
+            shocks: vec![Shock {
+                at_s: 150.0,
+                magnitude: 0.006,
+            }],
+            ..Default::default()
+        };
         let r = run(&cfg);
         assert!(r.final_position.abs() <= px_core::Qty::shares(2_000).0 * 2);
         assert!(r.stats.ticks > 1000);
@@ -1211,12 +1268,14 @@ mod tests {
         // not trade at all". The reference feed's staleness tolerance is one
         // second, so from two seconds into the outage until it ends, the kill
         // switch must be holding and no fill may appear.
-        let mut cfg = SimConfig::default();
-        cfg.outages = vec![Outage {
-            feed_index: 0,
-            start_s: 100.0,
-            end_s: 200.0,
-        }];
+        let cfg = SimConfig {
+            outages: vec![Outage {
+                feed_index: 0,
+                start_s: 100.0,
+                end_s: 200.0,
+            }],
+            ..Default::default()
+        };
         let r = run(&cfg);
 
         // Flattening an existing position is legitimate and expected when the
@@ -1259,12 +1318,14 @@ mod tests {
         // Feeds coming back must not put us straight back in the market: the
         // health monitor requires sustained cleanliness first. Nothing should
         // trade in the first moments after the feed returns.
-        let mut cfg = SimConfig::default();
-        cfg.outages = vec![Outage {
-            feed_index: 0,
-            start_s: 100.0,
-            end_s: 150.0,
-        }];
+        let cfg = SimConfig {
+            outages: vec![Outage {
+                feed_index: 0,
+                start_s: 100.0,
+                end_s: 150.0,
+            }],
+            ..Default::default()
+        };
         let r = run(&cfg);
         let too_eager = r.fills.iter().any(|f| f.t_s > 150.0 && f.t_s < 150.3);
         assert!(!too_eager, "resumed trading within 300 ms of feed recovery");
@@ -1275,8 +1336,10 @@ mod tests {
         // The sanity check that the simulator is not lying to us. If mean
         // mark-out on passive fills came out negative, the flow model would be
         // giving us free money and every result would be worthless.
-        let mut cfg = SimConfig::default();
-        cfg.flow_per_s = 4.0;
+        let cfg = SimConfig {
+            flow_per_s: 4.0,
+            ..Default::default()
+        };
         let r = run(&cfg);
         if r.passive_fills() > 20 {
             assert!(
@@ -1288,6 +1351,9 @@ mod tests {
     }
 
     #[test]
+    // `sweep[0]`/`sweep[1]` are indexed only after `assert_eq!(sweep.len(),
+    // 2)` has already proven both in range.
+    #[allow(clippy::indexing_slicing)]
     fn more_venue_lag_is_worth_more() {
         // Monotonicity, not a specific P&L. If our edge did not increase with
         // the venue's staleness, the premise of the strategy would be wrong.

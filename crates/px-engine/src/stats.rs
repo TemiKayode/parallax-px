@@ -81,10 +81,10 @@ impl PerformanceTracker {
         }
         if pnl >= 0.0 {
             self.gross_profit += pnl;
-            self.wins += 1;
+            self.wins = self.wins.saturating_add(1);
         } else {
             self.gross_loss += -pnl;
-            self.losses += 1;
+            self.losses = self.losses.saturating_add(1);
         }
     }
 
@@ -134,7 +134,7 @@ impl PerformanceTracker {
     }
 
     pub fn win_rate(&self) -> f64 {
-        let total = self.wins + self.losses;
+        let total = self.wins.saturating_add(self.losses);
         if total == 0 {
             0.0
         } else {
@@ -161,7 +161,7 @@ impl PerformanceTracker {
     /// Expected P&L per trade, in dollars. The only statistic here that is
     /// directly actionable.
     pub fn expectancy(&self) -> f64 {
-        let total = self.wins + self.losses;
+        let total = self.wins.saturating_add(self.losses);
         if total == 0 {
             0.0
         } else {
@@ -171,7 +171,7 @@ impl PerformanceTracker {
 
     #[inline(always)]
     pub fn trades(&self) -> u64 {
-        self.wins + self.losses
+        self.wins.saturating_add(self.losses)
     }
 
     #[inline(always)]
@@ -185,6 +185,10 @@ mod tests {
     use super::*;
 
     #[test]
+    // Every one of these hits an explicit early-return literal `0.0` on a
+    // fresh tracker (`n < 2`, `max_dd`'s `0.0` initialiser, `total == 0`,
+    // `wins == 0`) — exact by construction, not a computed value.
+    #[allow(clippy::float_cmp)]
     fn empty_tracker_reports_zeros_not_nans() {
         let p = PerformanceTracker::new(1.0);
         assert_eq!(p.sharpe(), 0.0);
@@ -206,6 +210,9 @@ mod tests {
     }
 
     #[test]
+    // Zero variance makes `sd <= 0.0`, which `sharpe` handles with an
+    // explicit `return 0.0;` — exact by construction.
+    #[allow(clippy::float_cmp)]
     fn a_steady_gainer_has_infinite_sharpe_guarded_to_finite() {
         // Constant increments have zero variance; we return 0 rather than inf.
         let mut p = PerformanceTracker::new(1.0);

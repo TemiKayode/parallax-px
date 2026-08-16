@@ -64,6 +64,15 @@ pub struct CrossAsset {
     effective_dof: f64,
 }
 
+// Every array field (`cov: [[f64; N]; N]`, `last_px`/`last_ts`/`anchor_px`/
+// `seen`/`loadings`/`r2`: `[_; N]`) is declared with exactly `N` elements,
+// and every loop below iterates `0..N` (or a `j` similarly bounded) — the
+// same fixed-size relationship `px_core::book`'s `LEVELS`-bounded loops
+// already rely on for the identical proof. Index-based iteration (rather
+// than `.iter()`) is deliberate throughout: several loops need the index
+// itself (diagonal access `cov[i][i]`, two arrays walked in lockstep,
+// row/column access into a 2D array), not just the element.
+#[allow(clippy::indexing_slicing, clippy::needless_range_loop)]
 impl CrossAsset {
     pub fn new(half_life_s: f64, sample_dt_s: f64) -> Self {
         let mut c = CrossAsset {
@@ -92,7 +101,9 @@ impl CrossAsset {
     /// sampling boundary.
     #[inline]
     pub fn observe(&mut self, asset: usize, price: f64, ts: f64) {
-        if asset >= N || !(price > 0.0) || !price.is_finite() {
+        // `!price.is_finite()` already rejects NaN, so the plain `<= 0.0`
+        // here does not need to handle the incomparable case itself.
+        if asset >= N || price <= 0.0 || !price.is_finite() {
             return;
         }
         if !self.seen[asset] {
@@ -142,7 +153,7 @@ impl CrossAsset {
                 self.cov[i][j] = decay * self.cov[i][j] + (1.0 - decay) * x;
             }
         }
-        self.n_samples += 1;
+        self.n_samples = self.n_samples.saturating_add(1);
         self.recompute();
         true
     }
@@ -316,7 +327,7 @@ impl CrossAsset {
             let z_j = r_j / sigma[j];
             num += self.loadings[j] * z_j;
             den += self.loadings[j] * self.loadings[j];
-            contributors += 1;
+            contributors = contributors.saturating_add(1);
         }
 
         if contributors == 0 || den <= 1e-12 {
@@ -371,6 +382,9 @@ impl Nowcast {
 }
 
 #[cfg(test)]
+// Same bound as `impl CrossAsset` above: every array here is sized `N`
+// and every loop iterates `0..N`.
+#[allow(clippy::indexing_slicing, clippy::needless_range_loop)]
 mod tests {
     use super::*;
 
@@ -439,6 +453,9 @@ mod tests {
     }
 
     #[test]
+    // `marginal_information(t, t)` hits the explicit `target == source`
+    // early return of a literal `0.0` — exact by construction.
+    #[allow(clippy::float_cmp)]
     fn marginal_information_is_high_for_uncorrelated_pairs() {
         let mut c = CrossAsset::new(60.0, 0.25);
         let mut rng = Lcg(99);
@@ -493,6 +510,10 @@ mod tests {
     }
 
     #[test]
+    // `nc` is `Nowcast::default()` (the `contributors == 0` early-return
+    // path), whose `log_return` field is `f64::default()` — a literal
+    // `0.0`, exact by construction.
+    #[allow(clippy::float_cmp)]
     fn nowcast_is_silent_when_no_peer_is_fresher() {
         let mut c = CrossAsset::new(30.0, 0.25);
         let mut t = 0.0;

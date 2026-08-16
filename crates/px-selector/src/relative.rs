@@ -134,6 +134,12 @@ impl Default for Ranker {
     }
 }
 
+// `self.len` only ever changes via `clear` (-> 0) and `push` (+1, guarded
+// by `self.len >= MAX_CANDIDATES` returning early first), so it is always
+// `<= MAX_CANDIDATES` — the same relationship to `items`'s declared
+// length that `px_core::book`'s `LEVELS`-bounded indexing already relies
+// on for its proof.
+#[allow(clippy::indexing_slicing)]
 impl Ranker {
     #[inline]
     pub fn clear(&mut self) {
@@ -146,7 +152,7 @@ impl Ranker {
             return false;
         }
         self.items[self.len] = c;
-        self.len += 1;
+        self.len = self.len.saturating_add(1);
         true
     }
 
@@ -183,7 +189,10 @@ impl Ranker {
                 None => true,
                 // Rank by total edge dollars, not by z. A spectacular z-score on
                 // a market that holds nine shares is not where capital goes.
-                Some(b) => (c.net_edge as i64) * c.size.0 > (b.net_edge as i64) * b.size.0,
+                Some(b) => {
+                    (c.net_edge as i64).saturating_mul(c.size.0)
+                        > (b.net_edge as i64).saturating_mul(b.size.0)
+                }
             };
             if better {
                 best = Some(c);
@@ -210,7 +219,10 @@ impl Ranker {
                 }
                 let better = match pick {
                     None => true,
-                    Some(p) => (c.net_edge as i64) * c.size.0 > (p.net_edge as i64) * p.size.0,
+                    Some(p) => {
+                        (c.net_edge as i64).saturating_mul(c.size.0)
+                            > (p.net_edge as i64).saturating_mul(p.size.0)
+                    }
                 };
                 if better {
                     pick = Some(*c);
@@ -248,6 +260,13 @@ pub struct PairCost {
 }
 
 /// Price a complete set against both order books.
+///
+/// `wy.avg_px.0`/`wn.avg_px.0` are `Px`, bounded to `[0, 1_000_000]`, so
+/// `gross` is bounded to `[0, 2_000_000]` — well inside `i32`. `fee` is
+/// two `taker_per_share` calls, each a small fraction of a share's price;
+/// `1_000_000 - gross - fee` has no realistic path to `i32` overflow from
+/// operands this small.
+#[allow(clippy::arithmetic_side_effects)]
 pub fn price_pair(
     yes_book: &px_core::DenseBook,
     no_book: &px_core::DenseBook,
@@ -287,6 +306,9 @@ mod tests {
     use px_core::{Category, DenseBook, Qty, Side};
 
     #[test]
+    // 50 observations is below `z`'s own `n < 100` warm-up floor, which
+    // returns a literal `0.0` — exact by construction.
+    #[allow(clippy::float_cmp)]
     fn gap_tracker_is_silent_until_warm() {
         let mut g = GapTracker::new(0.05);
         for _ in 0..50 {
@@ -320,6 +342,9 @@ mod tests {
     }
 
     #[test]
+    // `observe` returns before touching any field when `!gap.is_finite()`,
+    // so `typical()` is computed from bit-identical state both times.
+    #[allow(clippy::float_cmp)]
     fn gap_tracker_ignores_nonsense() {
         let mut g = GapTracker::new(0.05);
         for _ in 0..200 {
@@ -332,6 +357,9 @@ mod tests {
     }
 
     #[test]
+    // Zero variance in the observed gap makes `sd() <= 1.0`, which `z`
+    // handles with an explicit `return 0.0;` — exact by construction.
+    #[allow(clippy::float_cmp)]
     fn zero_volatility_market_reports_no_signal() {
         let mut g = GapTracker::new(0.05);
         for _ in 0..500 {
@@ -353,6 +381,10 @@ mod tests {
     }
 
     #[test]
+    // `.unwrap()` here is the test: if `best` ever returns `None` for a
+    // ranker holding two actionable candidates, panicking is the correct,
+    // intended failure — not a production safety concern.
+    #[allow(clippy::unwrap_used)]
     fn ranker_prefers_total_edge_over_headline_z_score() {
         // The trap the brief warns about: a 9-cent edge on 50 shares versus a
         // 3-cent edge on 400 shares. The second is worth three times as much.
@@ -364,6 +396,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::unwrap_used)]
     fn ranker_skips_non_actionable_candidates() {
         let mut r = Ranker::default();
         let mut c = cand(1, 9.0, 90_000, 1000, 0);
@@ -374,6 +407,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::unwrap_used)]
     fn ranker_respects_correlation_buckets() {
         // BTC 5m and BTC 15m share bucket 0: once we hold one, the other is
         // the same bet and must not also be selected.
@@ -390,6 +424,9 @@ mod tests {
     }
 
     #[test]
+    // `out[0]`/`out[1]` are indexed only after `assert_eq!(out.len(), 2)`
+    // has already proven both in range.
+    #[allow(clippy::indexing_slicing)]
     fn best_per_bucket_returns_one_per_bucket() {
         let mut r = Ranker::default();
         r.push(cand(1, 5.0, 50_000, 500, 0));
@@ -419,7 +456,11 @@ mod tests {
     fn one_sided(px: i32, shares: i64) -> DenseBook {
         let mut b = DenseBook::new(10_000);
         b.set_level(Side::Ask, Px(px), Qty::shares(shares));
-        b.set_level(Side::Bid, Px(px - 20_000), Qty::shares(shares));
+        b.set_level(
+            Side::Bid,
+            Px(px.saturating_sub(20_000)),
+            Qty::shares(shares),
+        );
         b
     }
 

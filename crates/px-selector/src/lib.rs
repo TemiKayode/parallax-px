@@ -221,12 +221,12 @@ impl Selector {
         if changed {
             self.structure = s;
             self.entered_at = now;
-            self.transitions += 1;
+            self.transitions = self.transitions.saturating_add(1);
         }
         if let Some(d) = dir {
             if self.last_dir != Some(d) {
                 if self.last_dir.is_some() {
-                    self.rotations += 1;
+                    self.rotations = self.rotations.saturating_add(1);
                     self.last_rotation = now;
                 }
                 self.last_dir = Some(d);
@@ -297,15 +297,16 @@ impl Selector {
         let locked = !self.dwell_satisfied(now);
 
         // --- 4. Capital locked in complete sets, and time is short. ---
-        if ctx.matched > 0 && ctx.tau < self.cfg.capital_release_tau {
-            if !locked || self.structure == Structure::InventoryRelease {
-                return self.enter(
-                    Structure::InventoryRelease,
-                    Reason::CapitalLocked,
-                    now,
-                    None,
-                );
-            }
+        if ctx.matched > 0
+            && ctx.tau < self.cfg.capital_release_tau
+            && (!locked || self.structure == Structure::InventoryRelease)
+        {
+            return self.enter(
+                Structure::InventoryRelease,
+                Reason::CapitalLocked,
+                now,
+                None,
+            );
         }
 
         // --- 5. Free money. Takes precedence over any model-dependent view. ---
