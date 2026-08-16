@@ -93,9 +93,10 @@ wrong.
 
 ## Status: research prototype
 
-310 tests pass (plus 19 more in the standalone `tools/px-record`), debug and
-release. It is **not profitable in simulation** — median −$232 across 40
-seeds, 3/40 profitable. It has never touched a live venue and there is no
+317 tests pass (plus 19 more in the standalone `tools/px-record`), debug and
+release. It is **not profitable in simulation** — median −$225 across 40
+seeds, 3/40 profitable (rewards now paid — see below — move this by a few
+dollars, not the conclusion). It has never touched a live venue and there is no
 code path that could.
 
 Do not point this at money. What it is good for is the modelling and the
@@ -207,6 +208,38 @@ care `px-core`'s fix required.
   "worse than the venue" side. The naive statistic (t = +44.40 at 500 seeds)
   was overstating that same conclusion's confidence by roughly 10x throughout.
 - **A LICENSE** — MIT, matching the sibling `parallax-ui` repo.
+- **The simulator now actually pays liquidity rewards, and the engine has a
+  mode built to earn them.** `assess_make` and `RewardModel` have always
+  *reasoned* about reward accrual, but `px-engine::replay::run` tracked
+  `quote_uptime` without ever crediting `cash` for it — every result to date,
+  including the −$232 median above, measured a strategy with that entire
+  income line switched off. Fixed: a qualifying tick now pays
+  `RewardModel::credit_per_share_sec` into `cash` and a new
+  `Report::reward_income`, both sides independently. Alongside it,
+  `QuoteMode` makes explicit that edge-seeking (quote our own fair value,
+  earn the mispricing) and reward-harvesting (quote the venue's mid, earn
+  presence) are different businesses with different requirements — the
+  latter needs a model no better than the mid, not one that beats it.
+  `px-replay`'s "EDGE-SEEKING vs REWARD-HARVESTING" section runs both across
+  40 seeds each. Honest result: reward income is real but negligible at this
+  engine's `base_size` of 200 shares — a few tenths of a cent per session,
+  regardless of mode. `RewardModel::est_total_q` (the venue's total
+  qualifying volume, used to size one participant's share of the pool) is
+  currently a placeholder constant, not a measured one, and is the single
+  biggest unverified input standing between this number and a trustworthy
+  one — scaling `base_size` up changes the reward line roughly linearly, but
+  by the time it is large enough to matter it is also multiples of the
+  position limit, which is a different problem to solve first.
+- **Recalibration, tested honestly.** `px_score::calibrate` fits a monotone
+  isotonic map (pool-adjacent-violators) from model forecasts to outcomes and
+  scores it on data the fit never saw — split by *session*, not by forecast,
+  since forecasts sharing a session share one outcome and a random split
+  leaks the answer. `px-replay`'s "CAN RECALIBRATION FIX IT?" section runs
+  it across 120 seeds. Result: reliability roughly halves (the model's stated
+  probabilities become closer to true frequencies) but skill stays negative
+  — recalibration was part of the fix, not all of it, which is the correct,
+  narrow claim for a monotone map to be able to make: it can repair
+  miscalibration, not manufacture resolution that was never there.
 
 ---
 

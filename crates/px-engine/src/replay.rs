@@ -149,6 +149,8 @@ pub struct SimConfig {
     /// `crate::recording`'s module doc for exactly what that does and
     /// does not replace.
     pub venue_quotes: VenueQuoteSource,
+    /// Which business the engine is in. See `crate::QuoteMode`.
+    pub mode: crate::QuoteMode,
 }
 
 /// See `SimConfig::venue_quotes` and `crate::recording`.
@@ -185,6 +187,7 @@ impl Default for SimConfig {
             twap_window_s: 60.0,
             category: Category::Crypto,
             venue_quotes: VenueQuoteSource::Synthetic,
+            mode: crate::QuoteMode::EdgeSeeking,
         }
     }
 }
@@ -247,6 +250,13 @@ pub struct Report {
     /// Does the model actually beat the venue mid? The question the whole
     /// system rests on, answered without placing a single order.
     pub scorecard: px_score::Scorecard,
+    /// Liquidity-reward income actually accrued, micro-dollars.
+    ///
+    /// The edge calculator has always *reasoned* about reward accrual, but the
+    /// simulator never paid it — so every result before this measured a
+    /// reward-harvesting strategy with the rewards switched off. That is the
+    /// entire income line of the business, omitted.
+    pub reward_income: i64,
     /// Mark-to-model equity sampled each tick, for plotting.
     pub equity_curve: Vec<f64>,
     /// The resolved forecasts themselves, so callers can pool across seeds.
@@ -365,7 +375,10 @@ pub fn run(cfg: &SimConfig) -> Report {
     };
 
     let mut eng = Engine::new(
-        EngineConfig::default(),
+        EngineConfig {
+            mode: cfg.mode,
+            ..EngineConfig::default()
+        },
         Usd::dollars(100_000),
         px_risk::Tier::Standard,
         Nanos::ZERO,
@@ -413,6 +426,7 @@ pub fn run(cfg: &SimConfig) -> Report {
     let mut latency_misses = 0u32;
     let mut fees_paid = 0i64;
     let mut equity_curve: Vec<f64> = Vec::new();
+    let mut reward_income: i64 = 0;
     // Forecast log: what the model said vs what the venue said, at the same
     // instant. Resolved against the settled outcome at the end of the run.
     let mut forecasts: Vec<px_score::Forecast> = Vec::new();
@@ -656,6 +670,30 @@ pub fn run(cfg: &SimConfig) -> Report {
                 let d = (mid.0 - b.0).abs() / m.spec.tick;
                 if d <= m.spec.reward_max_spread_ticks {
                     quote_live_time += cfg.tick_dt_s;
+                    // Pay the reward. Both sides accrue independently, and
+                    // qualifying is a hard cliff on size. The edge calculator
+                    // has always reasoned about this accrual; until this fix
+                    // the simulator never actually paid it, so every prior
+                    // result measured a reward-harvesting strategy with the
+                    // rewards switched off.
+                    let two_sided = live_ask.is_some();
+                    let mut credit = 0.0;
+                    if live_bid_qty >= m.spec.reward_min_size {
+                        credit += m.rewards.credit_per_share_sec(d, live_bid_qty, two_sided)
+                            * live_bid_qty.as_f64();
+                    }
+                    if let Some(a) = live_ask {
+                        let da = (mid.0 - a.0).abs() / m.spec.tick;
+                        if da <= m.spec.reward_max_spread_ticks
+                            && live_ask_qty >= m.spec.reward_min_size
+                        {
+                            credit += m.rewards.credit_per_share_sec(da, live_ask_qty, two_sided)
+                                * live_ask_qty.as_f64();
+                        }
+                    }
+                    let earned = (credit * cfg.tick_dt_s) as i64;
+                    cash += earned;
+                    reward_income += earned;
                 }
             }
         }
@@ -874,6 +912,7 @@ pub fn run(cfg: &SimConfig) -> Report {
         passive_shares,
         scorecard,
         scorecard_inputs,
+        reward_income,
         equity_curve,
         fills,
     }

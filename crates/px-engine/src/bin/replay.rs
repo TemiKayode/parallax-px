@@ -225,6 +225,62 @@ fn main() {
     print!("{}", px_score::report(&card));
 
     // ---------------------------------------------------------------
+    // Two businesses, same market, same seeds.
+    // ---------------------------------------------------------------
+    println!("\n\n{}", "=".repeat(78));
+    println!("EDGE-SEEKING vs REWARD-HARVESTING");
+    println!("{}\n", "=".repeat(78));
+    println!("Same markets, same seeds, same model. The only difference is what the");
+    println!("engine is trying to do: beat the mid, or be present near it.\n");
+    println!(
+        "{:<22} {:>10} {:>10} {:>10} {:>7} {:>9}",
+        "mode", "pnl($)", "trading($)", "rewards($)", "uptime", "aggr shrs"
+    );
+    println!("{}", "-".repeat(78));
+    for (label, mode) in [
+        ("edge-seeking", px_engine::QuoteMode::EdgeSeeking),
+        (
+            "reward-harvest d=3",
+            px_engine::QuoteMode::RewardHarvest { defensive_ticks: 3 },
+        ),
+        (
+            "reward-harvest d=6",
+            px_engine::QuoteMode::RewardHarvest { defensive_ticks: 6 },
+        ),
+    ] {
+        let mut tot = 0.0;
+        let mut rew = 0.0;
+        let mut up = 0.0;
+        let mut aggr = 0.0;
+        const N: u64 = 40;
+        for i in 0..N {
+            let mut c = SimConfig::default();
+            c.mode = mode;
+            c.flow_per_s = 4.0;
+            c.seed = 0x5EED ^ i.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            let r = run(&c);
+            tot += r.pnl_dollars();
+            rew += r.reward_income as f64 / 1e6;
+            up += r.quote_uptime;
+            aggr += r.aggressive_shares as f64 / 1e6;
+        }
+        let n = N as f64;
+        println!(
+            "{:<22} {:>10.2} {:>10.2} {:>10.4} {:>6.1}% {:>9.0}",
+            label,
+            tot / n,
+            (tot - rew) / n,
+            rew / n,
+            up / n * 100.0,
+            aggr / n
+        );
+    }
+    println!("\n  (means over 40 seeds; trading = pnl minus reward income)");
+    println!(
+        "\n  Read the reward figure with care: RewardModel::est_total_q (this venue's\n  estimated total qualifying volume, used to size each participant's share of\n  the pool) is currently a placeholder constant, not a measured one — see\n  crates/px-edge/src/fee.rs. It is the single biggest unverified input to the\n  dollar figures above; the ratio between modes is more trustworthy than\n  either mode's absolute number until it is replaced with something measured."
+    );
+
+    // ---------------------------------------------------------------
     // DOES THE MODEL BEAT THE VENUE MID? (real recorded data, not synthetic)
     // ---------------------------------------------------------------
     println!("\n\n{}", "=".repeat(72));
@@ -539,6 +595,27 @@ fn main() {
             };
             println!("\n  {verdict}");
         }
+    }
+
+    // ---------------------------------------------------------------
+    // Can recalibration fix it? Honest train/test, split by session.
+    // ---------------------------------------------------------------
+    println!("\n\n{}", "=".repeat(72));
+    println!("CAN RECALIBRATION FIX IT?");
+    println!("{}\n", "=".repeat(72));
+    {
+        let mut all = Vec::new();
+        for i in 0..120u64 {
+            let mut c = SimConfig::default();
+            c.seed = 0x5EED ^ i.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            // Tag every forecast with its session so the split cannot leak.
+            for mut r in run(&c).scorecard_inputs {
+                r.forecast.horizon_s = i as f64;
+                all.push(r);
+            }
+        }
+        let res = px_score::calibrate::train_test_split(&all, |r| r.forecast.horizon_s as u64);
+        print!("{}", px_score::calibrate::report(&res));
     }
 
     // ---------------------------------------------------------------

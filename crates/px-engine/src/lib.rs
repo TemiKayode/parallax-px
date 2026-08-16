@@ -230,9 +230,48 @@ pub struct Stats {
     pub structure_changes: u64,
 }
 
+/// What the quoting engine is trying to achieve.
+///
+/// # Two different businesses
+///
+/// These are not two tunings of one strategy. They are different sources of
+/// income with different requirements, and conflating them is what the first
+/// version of this engine did.
+///
+/// **Edge-seeking** quotes around our own fair value and earns the mispricing.
+/// It requires the model to be *better than the market* — a positive Brier
+/// skill score. Measured, ours is negative after recalibration. That business
+/// is not currently available to us.
+///
+/// **Reward harvesting** quotes around the *venue's* mid and earns the spread
+/// from uninformed flow, the maker rebate, and the venue's liquidity-reward
+/// pool. It does not require beating the market. It requires being *present*,
+/// tight, and not being run over — for which a model merely as good as the mid
+/// is sufficient. The model stops being a source of alpha and becomes a
+/// circuit breaker.
+///
+/// The venue pays roughly $550k a month across its 5-minute crypto markets for
+/// resting liquidity, scored on time-weighted presence rather than on being
+/// right. That is a real income line, and it is available to a participant with
+/// zero predictive skill.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum QuoteMode {
+    /// Centre quotes on our fair value. Income is the mispricing; requires
+    /// positive skill against the venue mid.
+    EdgeSeeking,
+    /// Centre quotes on the venue mid, tight enough to qualify for liquidity
+    /// rewards. The model is used defensively only: pull when it disagrees with
+    /// the mid by more than `defensive_ticks`, on the reasoning that a large
+    /// disagreement means either the mid is about to move or our model is
+    /// broken — and we do not want to be the counterparty in either case.
+    RewardHarvest { defensive_ticks: i32 },
+}
+
 /// Engine-wide tunables.
 #[derive(Clone, Copy, Debug)]
 pub struct EngineConfig {
+    /// Which business we are in. See `QuoteMode`.
+    pub mode: QuoteMode,
     pub edge: EdgeParams,
     pub risk: RiskLimits,
     /// Floor on the half-spread for passive quotes, micro-dollars. The actual
@@ -261,6 +300,7 @@ pub struct EngineConfig {
 impl Default for EngineConfig {
     fn default() -> Self {
         EngineConfig {
+            mode: QuoteMode::EdgeSeeking,
             edge: EdgeParams::default(),
             risk: RiskLimits::default(),
             half_spread: 15_000,
@@ -432,8 +472,33 @@ impl Engine {
         // The penalty uses the *conservative* volatility: here a high sigma
         // genuinely means "carry less inventory", so erring high is erring safe.
         // The price it is applied to came from the unbiased volatility.
+        //
+        // Where to centre the quote, and how wide, depends on the business.
+        let venue_mid = m.yes_book.mid();
+        let (centre, half_spread, mode_veto) = match cfg.mode {
+            QuoteMode::EdgeSeeking => (fv.p.as_px(), half_spread, false),
+            QuoteMode::RewardHarvest { defensive_ticks } => {
+                match venue_mid {
+                    // No mid means no reward band to sit in.
+                    None => (fv.p.as_px(), half_spread, true),
+                    Some(mid) => {
+                        // Sit one tick inside the qualifying spread. The reward
+                        // score is quadratic in distance from mid, so the
+                        // difference between 1 tick and 3 ticks out is a factor
+                        // of four in income.
+                        let target = (m.spec.reward_max_spread_ticks.max(1) - 1).max(1);
+                        let hs = target.saturating_mul(m.spec.tick);
+                        // Defensive veto: a large model/mid disagreement means
+                        // either the mid is stale or we are wrong. Neither is a
+                        // good moment to be the resting side.
+                        let gap_ticks = (fv.p.as_px().0 - mid.0).abs() / m.spec.tick.max(1);
+                        (mid, hs, gap_ticks > defensive_ticks)
+                    }
+                }
+            }
+        };
         let (mut raw_bid, mut raw_ask) = m.inventory.quote(
-            fv.p.as_px(),
+            centre,
             fv.delta,
             fv.settle_sd_risk,
             half_spread,
@@ -507,7 +572,7 @@ impl Engine {
         let bid_credit = if net_pos < 0 { carry } else { 0 };
         let ask_credit = if net_pos > 0 { carry } else { 0 };
 
-        let (best_make, best_make_ask) = if fv.usable && !too_uncertain {
+        let (best_make, best_make_ask) = if fv.usable && !too_uncertain && !mode_veto {
             let bid = assess_make(
                 &m.yes_book,
                 Dir::Buy,
