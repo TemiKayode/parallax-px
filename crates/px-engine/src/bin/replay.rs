@@ -406,6 +406,26 @@ fn main() {
         }
     }
 
+    // --- venue_lag_s: does the book's own exch_ts_ms/recv_ts_ns actually
+    // reflect the configured lag? A self-consistency check, not a
+    // real-data one — the calibration question below (does the *assumed*
+    // 0.4s match reality) is separate from this one (does the simulator
+    // internally do what its own config says it does). ---
+    println!("\nvenue_lag_s — is the simulator internally consistent with its own knob?");
+    {
+        let mut cfg = SimConfig::default();
+        cfg.flow_per_s = 3.0;
+        let measured = run(&cfg).mean_measured_latency_s;
+        println!(
+            "  configured venue_lag_s: {:.2}s   measured (DenseBook::measured_latency_s, averaged\n  over the run): {:.2}s",
+            cfg.venue_lag_s, measured
+        );
+        println!(
+            "  measured can only be >= configured — it also includes however long the book\n  sits unmoved between repositions, and `Venue::maybe_rebuild` only repositions\n  once the view has moved a full tick. A gap this size says the synthetic\n  venue reprices far less often than a per-tick config knob suggests: on a\n  quiet 300s session the TWAP-shaped fair-value view can sit inside one tick\n  for tens of seconds at a time, so most of {measured:.1}s is dead time between\n  real repositions, not the {:.2}s of modelled lag itself. Below the\n  configured value would mean the stamping is broken; this size of gap above\n  it is a real property of the simulated venue, not a bug.",
+            cfg.venue_lag_s
+        );
+    }
+
     // --- venue_lag_s: cross-correlate real venue returns against the real
     // BTC/USD reference feed, captured in the same session so the two
     // series genuinely overlap in time. ---

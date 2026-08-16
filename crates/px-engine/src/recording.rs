@@ -316,6 +316,17 @@ pub fn set_book_from_l2_snapshot(book: &mut DenseBook, snap: &RecordedBookSnapsh
 /// Sets `book`'s touch directly from a real recorded quote (the YES
 /// side) — see the module doc for why no synthetic spread or noise is
 /// layered on top.
+///
+/// Deliberately leaves `book.exch_ts_ms`/`recv_ts_ns` at whatever they
+/// were — `0` on a freshly constructed book. Polymarket's public REST
+/// book endpoint (what `tools/px-record` polls) returns a full snapshot
+/// with no server-side timestamp of its own; `RecordedQuote::t_s` is our
+/// own local capture time, normalised per market, not an exchange
+/// timestamp. Stamping `exch_ts_ms` from it would misrepresent a recorded
+/// replay as having a real feed-latency measurement it does not have —
+/// see `DenseBook::measured_latency_s`, which the synthetic venue path in
+/// `replay::Venue` *does* stamp honestly, because there the exchange's
+/// "as of" instant is a real, known quantity (`t - venue_lag_s`).
 pub fn set_book_from_quote(book: &mut DenseBook, q: RecordedQuote) {
     book.clear();
     let bid = Px::from_f64(q.bid);

@@ -88,12 +88,20 @@ pub struct DenseBook {
     ask_occ: [u64; WORDS],
     /// Venue tick size in micro-dollars (10_000 for 1c, 1_000 for 0.1c).
     pub tick: i32,
-    /// Exchange timestamp of the last applied update, in milliseconds.
+    /// Exchange timestamp of the last applied update, in milliseconds. `0`
+    /// means never set — see `measured_latency_s`.
     pub exch_ts_ms: u64,
     /// Local receive timestamp, in nanoseconds since process start.
     pub recv_ts_ns: u64,
-    /// Monotonic counter of applied updates; used to detect gaps on resync.
+    /// Count of updates applied via `set_level`, purely local — it counts
+    /// our own mutations, not anything the venue told us. It cannot detect
+    /// a gap on its own, because there is nothing external to compare it
+    /// against; see `apply_external_seq` for the thing that actually can.
     pub seq: u64,
+    /// The last venue-reported sequence number seen via `apply_external_seq`,
+    /// if any. `None` until the first call, which is the trivial no-gap
+    /// case — there is no prior number to have skipped past.
+    last_external_seq: Option<u64>,
     /// Count of malformed updates dropped at the boundary. A non-zero and
     /// rising value is a data-quality fault: either the venue is sending us
     /// garbage or our parser is wrong, and both mean stop quoting.
@@ -134,8 +142,56 @@ impl DenseBook {
             exch_ts_ms: 0,
             recv_ts_ns: 0,
             seq: 0,
+            last_external_seq: None,
             rejected: 0,
         }
+    }
+
+    /// Feed a venue-reported sequence number and detect a gap.
+    ///
+    /// A real delta feed (a websocket pushing incremental book changes)
+    /// numbers its own messages so a consumer can tell whether it saw every
+    /// one, in order: message 105 arriving right after 103 means 104 was
+    /// lost, and every level this book holds may now be wrong. Returns
+    /// `true` for the first call ever, or any call whose number is exactly
+    /// one past the last one seen; `false` means a gap was detected, and
+    /// this also clears the book — a book that is known to be desynced
+    /// must not keep quoting off it while waiting for a fresh snapshot.
+    ///
+    /// Nothing in this repo currently has real data to drive this with:
+    /// `tools/px-record` polls Polymarket's public REST book endpoint,
+    /// which returns a full snapshot with no message-level sequence number
+    /// of its own, and the replay harness either reconstructs a synthetic
+    /// book or replays those same full recorded snapshots. This method
+    /// exists, and is tested against synthetic sequences below, for the
+    /// day a real delta feed is wired in — until then, treat it the same
+    /// way this repo already treats its alpha sources: built and tested,
+    /// not yet exercised against anything live.
+    pub fn apply_external_seq(&mut self, external_seq: u64) -> bool {
+        let ok = match self.last_external_seq {
+            None => true,
+            Some(prev) => external_seq == prev.wrapping_add(1),
+        };
+        self.last_external_seq = Some(external_seq);
+        if !ok {
+            self.clear();
+        }
+        ok
+    }
+
+    /// How stale is the data this book currently holds, in seconds, as of
+    /// `now_s` — the true feed-latency metric `exch_ts_ms` exists to
+    /// support: local receive time minus the venue's own timestamp on the
+    /// update we last applied. `None` until `exch_ts_ms` has actually been
+    /// set by a caller; a freshly constructed book has nothing real to
+    /// measure this from, and reporting a huge nonsense value against the
+    /// epoch would be worse than admitting that.
+    #[inline]
+    pub fn measured_latency_s(&self, now_s: f64) -> Option<f64> {
+        if self.exch_ts_ms == 0 {
+            return None;
+        }
+        Some((now_s - self.exch_ts_ms as f64 / 1000.0).max(0.0))
     }
 
     /// Map a price to a level index, or `None` if it is outside the tradable
@@ -730,5 +786,83 @@ mod tests {
         b.set_level(Side::Ask, Px(520_000), Qty::shares(25));
         b.set_level(Side::Ask, Px(520_000), Qty::shares(25));
         assert_eq!(b.size_at(Side::Ask, Px(520_000)), Qty::shares(25));
+    }
+
+    #[test]
+    fn the_first_external_seq_is_never_a_gap() {
+        let mut b = DenseBook::new(10_000);
+        // Even starting at an arbitrary number: there is nothing prior to
+        // have skipped past.
+        assert!(b.apply_external_seq(9_001));
+    }
+
+    #[test]
+    fn a_consecutive_run_of_external_seqs_reports_no_gap() {
+        let mut b = book_with_ladder();
+        for s in 1..=10u64 {
+            assert!(b.apply_external_seq(s), "false gap at seq {s}");
+        }
+        // The book must still hold its levels — no gap means no resync.
+        assert_eq!(b.best_bid(), Some(Px(480_000)));
+    }
+
+    #[test]
+    fn a_skipped_external_seq_is_a_gap_and_clears_the_book() {
+        let mut b = book_with_ladder();
+        assert!(b.best_bid().is_some());
+        assert!(b.apply_external_seq(1));
+        assert!(b.apply_external_seq(2));
+        // 3 was dropped in transit; 4 arrives next.
+        assert!(!b.apply_external_seq(4), "a skip must report a gap");
+        // A book known to be desynced must not keep quoting off stale levels.
+        assert_eq!(b.best_bid(), None);
+        assert_eq!(b.best_ask(), None);
+    }
+
+    #[test]
+    fn a_duplicated_external_seq_is_also_a_gap_not_a_no_op() {
+        // Replaying the same message twice is not "no gap" either — the
+        // real message that should have followed it never arrived.
+        let mut b = DenseBook::new(10_000);
+        assert!(b.apply_external_seq(5));
+        assert!(!b.apply_external_seq(5));
+    }
+
+    #[test]
+    fn recovery_resumes_clean_tracking_from_the_new_number() {
+        let mut b = DenseBook::new(10_000);
+        assert!(b.apply_external_seq(1));
+        assert!(!b.apply_external_seq(3)); // gap: 2 was lost
+                                           // The caller resyncs with a fresh snapshot, then normal service resumes.
+        b.set_level(Side::Bid, Px(480_000), Qty::shares(10));
+        assert!(
+            b.apply_external_seq(4),
+            "tracking must resume from 3, not 1"
+        );
+    }
+
+    #[test]
+    fn measured_latency_is_none_until_exch_ts_ms_is_ever_set() {
+        let b = DenseBook::new(10_000);
+        assert_eq!(b.measured_latency_s(1_000.0), None);
+    }
+
+    #[test]
+    fn measured_latency_matches_the_gap_between_now_and_exch_ts() {
+        let mut b = DenseBook::new(10_000);
+        b.exch_ts_ms = 4_500; // 4.5s
+                              // 10.0s "now" minus a 4.5s-old update is 5.5s of measured latency.
+        let lat = b.measured_latency_s(10.0).unwrap();
+        assert!((lat - 5.5).abs() < 1e-9, "lat={lat}");
+    }
+
+    #[test]
+    fn measured_latency_never_goes_negative() {
+        // A book stamped slightly in the future relative to `now_s` (clock
+        // skew, or `now_s` sampled a tick before the stamp) must read as
+        // "not stale", not as a nonsensical negative latency.
+        let mut b = DenseBook::new(10_000);
+        b.exch_ts_ms = 10_000; // 10.0s
+        assert_eq!(b.measured_latency_s(9.0), Some(0.0));
     }
 }

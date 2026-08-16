@@ -93,7 +93,7 @@ wrong.
 
 ## Status: research prototype
 
-317 tests pass (plus 19 more in the standalone `tools/px-record`), debug and
+328 tests pass (plus 19 more in the standalone `tools/px-record`), debug and
 release. It is **not profitable in simulation** — median −$225 across 40
 seeds, 3/40 profitable (rewards now paid — see below — move this by a few
 dollars, not the conclusion). It has never touched a live venue and there is no
@@ -240,6 +240,32 @@ care `px-core`'s fix required.
   — recalibration was part of the fix, not all of it, which is the correct,
   narrow claim for a monotone map to be able to make: it can repair
   miscalibration, not manufacture resolution that was never there.
+- **`DenseBook::exch_ts_ms` and `seq` — actually wired, not just declared.**
+  Both fields existed with doc comments promising behaviour nothing
+  delivered: `exch_ts_ms` sat at `0` forever, and `seq` "used to detect gaps
+  on resync" was a local mutation counter with nothing to compare against —
+  the third instance of that exact pattern in this codebase (see the fixed
+  drawdown limit and the sizer-knows-which-side-reduces bugs). Fixed
+  honestly, in proportion to what data actually exists: `DenseBook::
+  apply_external_seq` is a real, tested gap detector (a skipped or
+  duplicated venue sequence number clears the book), but nothing in this
+  repo has a live delta feed to drive it with yet — `tools/px-record` polls
+  full REST snapshots, which carry no message-level sequence number at all
+  — so it is built and unit-tested against synthetic sequences, the same
+  posture this repo already takes with its alpha sources. `exch_ts_ms` is
+  now stamped for real in the *synthetic* venue path (from the reference
+  instant the book's current view reflects), which makes
+  `DenseBook::measured_latency_s` a genuine measurement rather than a
+  placeholder — and it immediately found something: on `SimConfig::
+  default()`, mean measured latency runs to ~20s against a configured
+  `venue_lag_s` of 0.4s, because the venue only repositions on a full-tick
+  move and a quiet 300s session can sit inside one tick for tens of seconds
+  at a time. `px-replay`'s new "is the simulator internally consistent with
+  its own knob?" section reports this. The *recorded*-data path leaves
+  `exch_ts_ms` at `0` deliberately — Polymarket's public book endpoint
+  returns no server-side timestamp of its own, so stamping one would
+  misrepresent a real recording as having a real latency measurement it
+  does not have; `recording::set_book_from_quote`'s doc comment says so.
 
 ---
 

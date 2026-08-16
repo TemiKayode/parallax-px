@@ -257,6 +257,15 @@ pub struct Report {
     /// reward-harvesting strategy with the rewards switched off. That is the
     /// entire income line of the business, omitted.
     pub reward_income: i64,
+    /// Mean of `DenseBook::measured_latency_s` sampled once per tick — the
+    /// true feed-latency metric, computed from real book timestamps rather
+    /// than assumed. In `Synthetic` venue mode this should track
+    /// `SimConfig::venue_lag_s` closely, since that is exactly what drives
+    /// it; a real divergence between the two would mean the config knob and
+    /// what the book actually reflects have come apart. `0.0` in `Recorded`
+    /// mode, where no real exchange timestamp exists to measure this from —
+    /// see `recording::set_book_from_quote`'s doc comment.
+    pub mean_measured_latency_s: f64,
     /// Mark-to-model equity sampled each tick, for plotting.
     pub equity_curve: Vec<f64>,
     /// The resolved forecasts themselves, so callers can pool across seeds.
@@ -307,7 +316,22 @@ impl Venue {
     /// Leaving the book alone between moves is not a simplification, it is the
     /// point: a resting order that has not been repriced since the reference
     /// moved is precisely the mispriced liquidity this strategy exists to find.
-    fn maybe_rebuild(&mut self, book: &mut px_core::DenseBook, view: f64, slot: usize) {
+    ///
+    /// `now_s` and `lagged_t` stamp `book.recv_ts_ns`/`exch_ts_ms`: `now_s`
+    /// unconditionally, since we "hear from" the venue every tick regardless
+    /// of whether its view has moved; `lagged_t` (the reference-feed instant
+    /// this view reflects) only inside `rebuild`, since the exchange
+    /// timestamp on the book's *content* only changes when that content
+    /// actually does.
+    fn maybe_rebuild(
+        &mut self,
+        book: &mut px_core::DenseBook,
+        view: f64,
+        slot: usize,
+        now_s: f64,
+        lagged_t: f64,
+    ) {
+        book.recv_ts_ns = (now_s.max(0.0) * 1e9) as u64;
         let n = self.noise * self.rng.normal();
         let want = Px::from_f64((view + n).clamp(0.02, 0.98));
         let moved = (want.0 - self.centred_at[slot]).abs();
@@ -315,11 +339,12 @@ impl Venue {
             return;
         }
         self.centred_at[slot] = want.0;
-        self.rebuild(book, want);
+        self.rebuild(book, want, lagged_t);
     }
 
-    fn rebuild(&mut self, book: &mut px_core::DenseBook, centre: Px) {
+    fn rebuild(&mut self, book: &mut px_core::DenseBook, centre: Px, lagged_t: f64) {
         book.clear();
+        book.exch_ts_ms = (lagged_t.max(0.0) * 1000.0) as u64;
         let bid = Px(centre.0 - self.half_spread)
             .clamp_unit()
             .floor_to_tick(self.tick);
@@ -427,6 +452,8 @@ pub fn run(cfg: &SimConfig) -> Report {
     let mut fees_paid = 0i64;
     let mut equity_curve: Vec<f64> = Vec::new();
     let mut reward_income: i64 = 0;
+    let mut latency_sum = 0.0f64;
+    let mut latency_n = 0u64;
     // Forecast log: what the model said vs what the venue said, at the same
     // instant. Resolved against the settled outcome at the end of the run.
     let mut forecasts: Vec<px_score::Forecast> = Vec::new();
@@ -497,8 +524,8 @@ pub fn run(cfg: &SimConfig) -> Report {
             VenueQuoteSource::Synthetic => {
                 let view = synthetic_view(lagged_spot);
                 let m = &mut eng.markets[0];
-                venue.maybe_rebuild(&mut m.yes_book, view, 0);
-                venue.maybe_rebuild(&mut m.no_book, 1.0 - view, 1);
+                venue.maybe_rebuild(&mut m.yes_book, view, 0, t, t - cfg.venue_lag_s);
+                venue.maybe_rebuild(&mut m.no_book, 1.0 - view, 1, t, t - cfg.venue_lag_s);
                 view
             }
             VenueQuoteSource::Recorded(quotes) => match crate::recording::lookup(quotes, t) {
@@ -517,12 +544,16 @@ pub fn run(cfg: &SimConfig) -> Report {
                     // case in practice.
                     let view = synthetic_view(lagged_spot);
                     let m = &mut eng.markets[0];
-                    venue.maybe_rebuild(&mut m.yes_book, view, 0);
-                    venue.maybe_rebuild(&mut m.no_book, 1.0 - view, 1);
+                    venue.maybe_rebuild(&mut m.yes_book, view, 0, t, t - cfg.venue_lag_s);
+                    venue.maybe_rebuild(&mut m.no_book, 1.0 - view, 1, t, t - cfg.venue_lag_s);
                     view
                 }
             },
         };
+        if let Some(lat) = eng.markets[0].yes_book.measured_latency_s(t) {
+            latency_sum += lat;
+            latency_n += 1;
+        }
         for f in Feed::ALL {
             let down = cfg
                 .outages
@@ -913,6 +944,11 @@ pub fn run(cfg: &SimConfig) -> Report {
         scorecard,
         scorecard_inputs,
         reward_income,
+        mean_measured_latency_s: if latency_n > 0 {
+            latency_sum / latency_n as f64
+        } else {
+            0.0
+        },
         equity_curve,
         fills,
     }
@@ -1064,6 +1100,55 @@ mod tests {
     fn quote_uptime_is_a_fraction() {
         let r = run(&SimConfig::default());
         assert!(r.quote_uptime >= 0.0 && r.quote_uptime <= 1.0);
+    }
+
+    #[test]
+    fn measured_latency_is_never_below_the_configured_venue_lag() {
+        // `exch_ts_ms` is stamped from `t - venue_lag_s` only when the
+        // synthetic venue's book actually repositions, and `measured_latency_s`
+        // keeps growing between repositions — so the true mean is
+        // `venue_lag_s` plus however long the book typically sits unmoved,
+        // never less than `venue_lag_s` itself. A run reading below the
+        // configured lag would mean the stamping is wrong, not just noisy.
+        let mut cfg = SimConfig::default();
+        cfg.venue_lag_s = 1.5;
+        let r = run(&cfg);
+        assert!(
+            r.mean_measured_latency_s >= cfg.venue_lag_s,
+            "mean measured latency {} fell below the configured venue_lag_s {} — impossible if the stamping is correct",
+            r.mean_measured_latency_s,
+            cfg.venue_lag_s
+        );
+    }
+
+    #[test]
+    fn measured_latency_rises_with_a_larger_configured_venue_lag() {
+        // Same requote dynamics, only the lag changes — the measured floor
+        // should move with it.
+        let mut low = SimConfig::default();
+        low.venue_lag_s = 0.1;
+        let mut high = SimConfig::default();
+        high.venue_lag_s = 3.0;
+        let r_low = run(&low);
+        let r_high = run(&high);
+        assert!(
+            r_high.mean_measured_latency_s > r_low.mean_measured_latency_s,
+            "lag 3.0s measured {} did not exceed lag 0.1s measured {}",
+            r_high.mean_measured_latency_s,
+            r_low.mean_measured_latency_s
+        );
+    }
+
+    #[test]
+    fn measured_latency_is_zero_in_recorded_mode_with_no_real_exchange_timestamp() {
+        let raw = include_str!("../../../recordings/polymarket_sample.csv");
+        let quotes = crate::recording::load_recording(raw, "btc_4h");
+        let mut cfg = SimConfig::default();
+        cfg.duration_s = 700.0;
+        cfg.expiry_s = 700.0;
+        cfg.venue_quotes = VenueQuoteSource::Recorded(quotes);
+        let r = run(&cfg);
+        assert_eq!(r.mean_measured_latency_s, 0.0);
     }
 
     #[test]
