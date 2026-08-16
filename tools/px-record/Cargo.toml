@@ -1,0 +1,26 @@
+[workspace]
+# Empty table: this makes px-record its own workspace root regardless of
+# nesting under ../../Cargo.toml, which is what "deliberately not a member"
+# below actually requires — Cargo otherwise walks up to the nearest
+# ancestor workspace and claims this crate for it.
+
+[package]
+name = "px-record"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+publish = false
+
+# Deliberately NOT a member of the workspace at ../../Cargo.toml. The main
+# repo's headline claim is "zero external dependencies" — every px-* crate
+# builds against std alone. A recorder that polls a real HTTPS endpoint
+# needs a TLS stack, which is a real, unavoidable dependency; keeping it in
+# its own workspace means `cargo build --workspace`/`cargo test --workspace`
+# at the repo root never pulls it in, and that claim stays true. Build this
+# one directly: `cargo run --release` from this directory.
+[dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = 2

@@ -105,7 +105,13 @@ impl Frame {
     }
 }
 
-fn axes(f: &Frame, xlab: &str, ylab: &str, xticks: &[(f64, String)], yticks: &[(f64, String)]) -> String {
+fn axes(
+    f: &Frame,
+    xlab: &str,
+    ylab: &str,
+    xticks: &[(f64, String)],
+    yticks: &[(f64, String)],
+) -> String {
     let mut s = String::new();
     for (t, lab) in yticks {
         let y = f.sy(*t);
@@ -159,8 +165,8 @@ pub fn reliability(s: &Scorecard) -> Svg {
     let mut out = head(
         "Reliability — is the model calibrated?",
         &format!(
-            "n = {}   skill vs venue mid = {:+.4}   reliability = {:.5}   resolution = {:.5}",
-            s.n, s.skill_score, s.reliability, s.resolution
+            "n = {}   skill vs venue mid = {:+.4}   t(clustered) = {:+.2} over {} clusters   reliability = {:.5}   resolution = {:.5}",
+            s.n, s.skill_score, s.t_stat_clustered, s.n_clusters, s.reliability, s.resolution
         ),
     );
 
@@ -298,12 +304,21 @@ pub fn variance_shape(window_s: f64) -> Svg {
 <text x="{:.1}" y="{:.1}" font-size="10" fill="{MUTED}">spot / sqrt(t) model</text>
 <text x="{:.1}" y="{:.1}" font-size="10" fill="{ACCENT}">TWAP, correct</text>
 "#,
-        f.sx(frac), f.sy(t), f.sx(frac), f.sy(s_),
-        f.sx(frac), f.sy(t),
-        f.sx(frac), f.sy(s_),
-        f.sx(frac) + 8.0, f.sy((t + s_) / 2.0), frac * window_s,
-        f.sx(0.62), f.sy(0.86),
-        f.sx(0.62), f.sy(0.70)
+        f.sx(frac),
+        f.sy(t),
+        f.sx(frac),
+        f.sy(s_),
+        f.sx(frac),
+        f.sy(t),
+        f.sx(frac),
+        f.sy(s_),
+        f.sx(frac) + 8.0,
+        f.sy((t + s_) / 2.0),
+        frac * window_s,
+        f.sx(0.62),
+        f.sy(0.86),
+        f.sx(0.62),
+        f.sy(0.70)
     ));
 
     out.push_str("</svg>\n");
@@ -423,7 +438,10 @@ pub fn equity_curve(equity: &[f64], label: &str) -> Svg {
     let final_pnl = equity.last().copied().unwrap_or(0.0);
     let mut out = head(
         &format!("Equity — {label}"),
-        &format!("final {final_pnl:+.2}   peak-to-trough {max_dd:.2}   samples {}", equity.len()),
+        &format!(
+            "final {final_pnl:+.2}   peak-to-trough {max_dd:.2}   samples {}",
+            equity.len()
+        ),
     );
 
     let yt: Vec<(f64, String)> = (0..=4)
@@ -460,7 +478,9 @@ pub fn equity_curve(equity: &[f64], label: &str) -> Svg {
         let mut v = Vec::with_capacity(target * 2);
         for i in 0..target {
             let a = i * equity.len() / target;
-            let b = (((i + 1) * equity.len()) / target).max(a + 1).min(equity.len());
+            let b = (((i + 1) * equity.len()) / target)
+                .max(a + 1)
+                .min(equity.len());
             let slice = equity.get(a..b).unwrap_or(&[]);
             if slice.is_empty() {
                 continue;
@@ -547,7 +567,9 @@ pub fn sparkline(values: &[f64], width: usize) -> String {
         // Average the bucket rather than sampling it: a spike between two
         // sample points should not vanish because of where the grid landed.
         let a = i * values.len() / width;
-        let b = (((i + 1) * values.len()) / width).max(a + 1).min(values.len());
+        let b = (((i + 1) * values.len()) / width)
+            .max(a + 1)
+            .min(values.len());
         let slice = values.get(a..b).unwrap_or(&[]);
         if slice.is_empty() {
             out.push(' ');
@@ -612,7 +634,7 @@ mod tests {
     fn sample_card() -> Scorecard {
         let mut s = Scorer::new();
         let mut rng = Lcg(5);
-        for _ in 0..3000 {
+        for i in 0..3000u64 {
             let p = rng.u();
             s.record(Resolved {
                 forecast: Forecast {
@@ -620,6 +642,11 @@ mod tests {
                     model_p: p,
                     venue_p: 0.5,
                     horizon_s: 60.0,
+                    // Each draw is an independent sample for this test's
+                    // purposes (chart rendering, not clustering) — its own
+                    // cluster keeps the scorecard statistically well-formed
+                    // too, not just visually.
+                    cluster_id: i,
                 },
                 outcome: rng.u() < p,
             });
@@ -667,7 +694,12 @@ mod tests {
         let eq: Vec<f64> = (0..200)
             .map(|i| {
                 let x = i as f64;
-                x * 0.5 - if (40..90).contains(&i) { (x - 40.0) * 2.0 } else { 0.0 }
+                x * 0.5
+                    - if (40..90).contains(&i) {
+                        (x - 40.0) * 2.0
+                    } else {
+                        0.0
+                    }
             })
             .collect();
         let svg = equity_curve(&eq, "test");

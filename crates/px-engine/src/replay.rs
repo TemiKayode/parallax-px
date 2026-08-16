@@ -143,6 +143,20 @@ pub struct SimConfig {
     /// Settlement TWAP window.
     pub twap_window_s: f64,
     pub category: Category,
+    /// Where the venue's own quoted book comes from. `Synthetic` (the
+    /// default) is the existing `crude_fair` + noise + spread model;
+    /// `Recorded` replays a real, previously captured book instead — see
+    /// `crate::recording`'s module doc for exactly what that does and
+    /// does not replace.
+    pub venue_quotes: VenueQuoteSource,
+}
+
+/// See `SimConfig::venue_quotes` and `crate::recording`.
+#[derive(Clone, Debug, Default)]
+pub enum VenueQuoteSource {
+    #[default]
+    Synthetic,
+    Recorded(Vec<crate::recording::RecordedQuote>),
 }
 
 impl Default for SimConfig {
@@ -170,6 +184,7 @@ impl Default for SimConfig {
             expiry_s: 300.0,
             twap_window_s: 60.0,
             category: Category::Crypto,
+            venue_quotes: VenueQuoteSource::Synthetic,
         }
     }
 }
@@ -451,21 +466,49 @@ pub fn run(cfg: &SimConfig) -> Report {
             twap_last_px = spot;
         }
 
-        // --- Venue rebuilds its book off a lagged view ---
+        // --- Venue rebuilds its book off a lagged view (or, in
+        // `VenueQuoteSource::Recorded` mode, off a real one) ---
         let lagged_spot = lookup(&history, t - cfg.venue_lag_s).unwrap_or(spot);
         let tau = (cfg.expiry_s - t).max(0.0);
-        let venue_view = crude_fair(
-            lagged_spot,
-            cfg.strike,
-            sigma * lagged_spot,
-            tau,
-            cfg.twap_window_s,
-        );
-        {
-            let m = &mut eng.markets[0];
-            venue.maybe_rebuild(&mut m.yes_book, venue_view, 0);
-            venue.maybe_rebuild(&mut m.no_book, 1.0 - venue_view, 1);
-        }
+        let synthetic_view = |lagged_spot: f64| {
+            crude_fair(
+                lagged_spot,
+                cfg.strike,
+                sigma * lagged_spot,
+                tau,
+                cfg.twap_window_s,
+            )
+        };
+        let venue_view = match &cfg.venue_quotes {
+            VenueQuoteSource::Synthetic => {
+                let view = synthetic_view(lagged_spot);
+                let m = &mut eng.markets[0];
+                venue.maybe_rebuild(&mut m.yes_book, view, 0);
+                venue.maybe_rebuild(&mut m.no_book, 1.0 - view, 1);
+                view
+            }
+            VenueQuoteSource::Recorded(quotes) => match crate::recording::lookup(quotes, t) {
+                Some(q) => {
+                    let m = &mut eng.markets[0];
+                    crate::recording::set_book_from_quote(&mut m.yes_book, q);
+                    crate::recording::set_complementary_book_from_quote(&mut m.no_book, q);
+                    (q.bid + q.ask) / 2.0
+                }
+                None => {
+                    // Before the recording's first snapshot (or an empty
+                    // recording) — fall back to the synthetic estimate for
+                    // just this instant rather than leaving the book empty
+                    // or panicking. A real recording is built to start at
+                    // t_s = 0, so this is a defensive edge, not the common
+                    // case in practice.
+                    let view = synthetic_view(lagged_spot);
+                    let m = &mut eng.markets[0];
+                    venue.maybe_rebuild(&mut m.yes_book, view, 0);
+                    venue.maybe_rebuild(&mut m.no_book, 1.0 - view, 1);
+                    view
+                }
+            },
+        };
         for f in Feed::ALL {
             let down = cfg
                 .outages
@@ -510,6 +553,13 @@ pub fn run(cfg: &SimConfig) -> Report {
                         model_p: fv.p.as_f64(),
                         venue_p: mid.as_f64(),
                         horizon_s: (cfg.expiry_s - t).max(0.0),
+                        // Every forecast logged within one `run()` call
+                        // shares one simulated spot path — they are
+                        // correlated with each other and independent of
+                        // forecasts from a different seed. `cfg.seed` is
+                        // exactly that unit: see px-score's module doc,
+                        // "Clustering".
+                        cluster_id: cfg.seed,
                     });
                 }
             }
@@ -975,6 +1025,46 @@ mod tests {
     fn quote_uptime_is_a_fraction() {
         let r = run(&SimConfig::default());
         assert!(r.quote_uptime >= 0.0 && r.quote_uptime <= 1.0);
+    }
+
+    #[test]
+    fn a_real_recorded_venue_replay_runs_to_completion_without_panicking() {
+        // `docs/GOING-LIVE.md` Stage 0: "replay against recorded venue
+        // book data, not a synthetic venue." This recording is real —
+        // captured 2026-08-16 against two then-live Polymarket "Up or
+        // Down" markets with `tools/px-record` (see
+        // `recordings/README.md`) — and includes exactly the messy real
+        // data a synthetic generator never produces: a one-sided book
+        // with no ask at all in its final rows, as the market resolved
+        // and liquidity pulled. `load_recording` is expected to skip
+        // those rows (their "None" ask fields do not parse as f64), not
+        // choke on them — this test is the proof that holds end to end,
+        // not just at the parser.
+        let raw = include_str!("../../../recordings/polymarket_sample.csv");
+        let quotes = crate::recording::load_recording(raw, "btc_4h");
+        assert!(
+            quotes.len() > 100,
+            "expected a substantial real recording, got {} rows",
+            quotes.len()
+        );
+
+        let mut cfg = SimConfig::default();
+        cfg.duration_s = 700.0;
+        cfg.expiry_s = 700.0;
+        cfg.venue_quotes = VenueQuoteSource::Recorded(quotes);
+
+        let r = run(&cfg);
+        assert!(r.stats.ticks > 1000);
+        // A NaN anywhere here would mean a real recorded quote broke an
+        // assumption the synthetic generator never gets to violate (an
+        // out-of-domain price, a gap the lookup does not cover) —
+        // silently, not as a crash the test suite would otherwise catch.
+        assert!(!r.equity_curve.iter().any(|v| v.is_nan() || v.is_infinite()));
+        assert!(r.settle_twap.is_finite() && r.settle_twap > 0.0);
+        // Cash and settlement must still reconcile to the reported P&L —
+        // real data does not get a pass on the invariants synthetic runs
+        // are held to.
+        assert_eq!(r.pnl, r.cash + r.settlement);
     }
 
     #[test]

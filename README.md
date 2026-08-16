@@ -93,9 +93,9 @@ wrong.
 
 ## Status: research prototype
 
-248 tests pass, zero warnings, debug and release. It is **not profitable in
-simulation** — median −$232 across 40 seeds, 3/40 profitable. It has never
-touched a live venue and there is no code path that could.
+289 tests pass, debug and release. It is **not profitable in simulation** —
+median −$232 across 40 seeds, 3/40 profitable. It has never touched a live
+venue and there is no code path that could.
 
 Do not point this at money. What it is good for is the modelling and the
 harness, which between them have caught eleven real bugs, including a sign flip
@@ -103,11 +103,69 @@ in `exp` reachable through `norm_pdf` in the TWAP endgame, a NaN that failed
 *open* into zero safety margin, and an aggressive-churn loop that crossed 1.2
 million shares against 48,000 filled passively.
 
-The largest missing piece is replay against recorded book data. Every parameter
-in `SimConfig` is a guess until then.
+**Clippy, honestly:** `cargo clippy --workspace --all-targets -- -D warnings`
+does not currently pass on this toolchain (rustc/clippy 1.96.0) — `px-core`
+alone has 60+ pre-existing `clippy::arithmetic_side_effects`/`indexing_slicing`/
+`float_cmp` diagnostics under it, present on the very first commit of this
+repo, before any of the work below. Almost certainly a toolchain-version drift
+from whenever this was originally validated clean, not a regression introduced
+here — `cargo build`/`cargo test --workspace` both pass without warnings
+regardless, and the three crates touched in this pass (`px-score`, `px-engine`,
+`px-plot`) were separately verified clean against the same clippy with
+`px-core`'s blocking lints held aside for the check. Fixing `px-core` itself —
+bounds-checking every book index, deciding what fixed-point arithmetic actually
+needs overflow checking versus a scoped `#[allow]` — is real, separate work,
+stated here rather than left for someone to discover the hard way.
+
+**`cargo fmt`, same story.** `cargo fmt --all -- --check` does not complete in
+practical time on this toolchain (rustfmt 1.9.0) either — `px-core/src/lib.rs`
+and `px-core/src/math.rs` specifically (the deeply nested Horner-form
+polynomials in `exp`/`norm_ppf`) hit a known rustfmt performance pathology on
+deeply nested expressions and were still running after several minutes,
+standalone, with no other process involved. Every other file in the workspace
+(and the standalone `px-record` tool) formats cleanly and near-instantly on
+its own — checked file by file with plain `rustfmt --check`, since the `cargo
+fmt` wrapper hangs the moment it reaches either of those two files. Restructuring
+bit-exact numerical code to dodge a formatter's performance edge case is not
+something to do casually, so it is named here rather than either silently
+skipped or hacked around.
+
+### What changed since the 248-test snapshot
+
+- **Replay against recorded venue book data**, the thing the README used to
+  call the largest missing piece. `px_engine::recording::load_recording`
+  parses a real captured order-book series; `SimConfig::venue_quotes =
+  VenueQuoteSource::Recorded(..)` replaces the venue's synthetic
+  noise-plus-spread book with real recorded best bid/ask/size at each
+  instant — no synthetic spread layered on top, because there is nothing left
+  to simulate. `tools/px-record` (a separate, non-workspace Cargo project —
+  see its own `Cargo.toml` for why a networked recorder can't live inside a
+  zero-dependency workspace) is the recorder: it auto-discovers whichever
+  Polymarket "Up or Down" crypto markets are live and polls their real public
+  book. `recordings/polymarket_sample.csv` is a genuine sample it captured —
+  13 minutes across two then-live BTC markets, through actual settlement,
+  including a one-sided book with no ask at all in its last few rows as
+  liquidity pulled — and `crates/px-engine/src/replay.rs` has an integration
+  test that loads it and runs a full simulated session against it end to end.
+  What this does *not* yet replace: the reference price path (`spot`) is
+  still the synthetic GBM walk, so this checks "does the strategy behave
+  sanely against a real venue book," not yet "was the GBM assumption itself
+  right" — stated plainly in `recording.rs`'s module doc, not left implicit.
+- **Clustered standard errors in `px-score`.** The paired t-test used to treat
+  every logged forecast as independent, but `px-replay` pools ~200 per-second
+  forecasts from each of 60 simulated seeds — correlated within a seed, not
+  across 12,000 independent draws. `Scorecard::t_stat_clustered` (Cameron &
+  Miller 2015 CR1, specialised to a simple mean, one cluster per seed) is what
+  `has_edge()` actually gates on now; `t_stat` (the naive one) is kept
+  alongside it specifically so the gap is visible. Run for real against the
+  pooled 60-seed scorecard: naive t = **+10.21** (reads as confidently worse
+  than the venue), clustered t = **+1.00** (genuinely inconclusive, once you
+  count independent evidence instead of correlated readings of it) — the
+  naive statistic was overstating confidence by roughly 10x.
+- **A LICENSE** — MIT, matching the sibling `parallax-ui` repo.
 
 ---
 
 ## Licence
 
-Unlicensed / all rights reserved unless you add one.
+MIT — see `LICENSE`.

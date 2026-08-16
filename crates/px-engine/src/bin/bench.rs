@@ -50,7 +50,7 @@ fn rewards() -> RewardModel {
         est_total_q: 5e6,
         max_spread_ticks: 3,
         one_sided_divisor: 3.0,
-            min_qualifying_size: Qty::shares(50),
+        min_qualifying_size: Qty::shares(50),
     }
 }
 
