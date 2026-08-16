@@ -93,9 +93,10 @@ wrong.
 
 ## Status: research prototype
 
-289 tests pass, debug and release. It is **not profitable in simulation** —
-median −$232 across 40 seeds, 3/40 profitable. It has never touched a live
-venue and there is no code path that could.
+299 tests pass (plus 9 more in the standalone `tools/px-record`), debug and
+release. It is **not profitable in simulation** — median −$232 across 40
+seeds, 3/40 profitable. It has never touched a live venue and there is no
+code path that could.
 
 Do not point this at money. What it is good for is the modelling and the
 harness, which between them have caught eleven real bugs, including a sign flip
@@ -103,32 +104,27 @@ in `exp` reachable through `norm_pdf` in the TWAP endgame, a NaN that failed
 *open* into zero safety margin, and an aggressive-churn loop that crossed 1.2
 million shares against 48,000 filled passively.
 
-**Clippy, honestly:** `cargo clippy --workspace --all-targets -- -D warnings`
-does not currently pass on this toolchain (rustc/clippy 1.96.0) — `px-core`
-alone has 60+ pre-existing `clippy::arithmetic_side_effects`/`indexing_slicing`/
-`float_cmp` diagnostics under it, present on the very first commit of this
-repo, before any of the work below. Almost certainly a toolchain-version drift
-from whenever this was originally validated clean, not a regression introduced
-here — `cargo build`/`cargo test --workspace` both pass without warnings
-regardless, and the three crates touched in this pass (`px-score`, `px-engine`,
-`px-plot`) were separately verified clean against the same clippy with
-`px-core`'s blocking lints held aside for the check. Fixing `px-core` itself —
-bounds-checking every book index, deciding what fixed-point arithmetic actually
-needs overflow checking versus a scoped `#[allow]` — is real, separate work,
-stated here rather than left for someone to discover the hard way.
-
-**`cargo fmt`, same story.** `cargo fmt --all -- --check` does not complete in
-practical time on this toolchain (rustfmt 1.9.0) either — `px-core/src/lib.rs`
-and `px-core/src/math.rs` specifically (the deeply nested Horner-form
-polynomials in `exp`/`norm_ppf`) hit a known rustfmt performance pathology on
-deeply nested expressions and were still running after several minutes,
-standalone, with no other process involved. Every other file in the workspace
-(and the standalone `px-record` tool) formats cleanly and near-instantly on
-its own — checked file by file with plain `rustfmt --check`, since the `cargo
-fmt` wrapper hangs the moment it reaches either of those two files. Restructuring
-bit-exact numerical code to dodge a formatter's performance edge case is not
-something to do casually, so it is named here rather than either silently
-skipped or hacked around.
+**Clippy and `cargo fmt`, honestly.** `px-core` — the crate everything else in
+the workspace depends on — is now fully clean: `cargo clippy -p px-core
+--all-targets -- -D warnings` and `cargo fmt --check` on every file in it both
+pass, including fixing a genuine rustfmt performance pathology in `exp`'s
+Horner-form polynomial (restructured into an equivalent loop, verified
+bit-exact against the existing test suite, not just reformatted around). The
+rest of the workspace (`px-alpha`, `px-edge`, `px-inventory`, `px-selector`,
+`px-risk`, and most of `px-engine`'s own pre-existing code) still does not
+pass `cargo clippy --workspace --all-targets -- -D warnings` on this toolchain
+(rustc/clippy 1.96.0) — several hundred more `clippy::indexing_slicing` /
+`clippy::arithmetic_side_effects` / `clippy::needless_range_loop` diagnostics,
+present on the very first commit of this repo, before any work in this repo
+touched them. Almost certainly toolchain-version drift from whenever this was
+originally validated clean, not a regression — `cargo build`/`cargo test
+--workspace` both pass without warnings regardless, and every file actually
+touched in this repo's work (`px-score`, `px-plot`, and the specific files
+changed in `px-engine`) was separately verified clippy-clean by temporarily
+holding the upstream crates' blocking lints aside for the check. Fully fixing
+`px-alpha` etc. is real, substantial, separate work — scoped out here rather
+than either quietly ignored or rushed through without the same bit-exactness
+care `px-core`'s fix required.
 
 ### What changed since the 248-test snapshot
 
@@ -142,26 +138,48 @@ skipped or hacked around.
   see its own `Cargo.toml` for why a networked recorder can't live inside a
   zero-dependency workspace) is the recorder: it auto-discovers whichever
   Polymarket "Up or Down" crypto markets are live and polls their real public
-  book. `recordings/polymarket_sample.csv` is a genuine sample it captured —
-  13 minutes across two then-live BTC markets, through actual settlement,
-  including a one-sided book with no ask at all in its last few rows as
-  liquidity pulled — and `crates/px-engine/src/replay.rs` has an integration
-  test that loads it and runs a full simulated session against it end to end.
-  What this does *not* yet replace: the reference price path (`spot`) is
-  still the synthetic GBM walk, so this checks "does the strategy behave
-  sanely against a real venue book," not yet "was the GBM assumption itself
-  right" — stated plainly in `recording.rs`'s module doc, not left implicit.
+  book, both YES and NO, touch and full depth (see below). What this does
+  *not* replace: the reference price path (`spot`) is still the synthetic GBM
+  walk — `recording.rs`'s module doc says so plainly, and it matters more
+  than it sounds: the first attempt at scoring the model against a *real*
+  settled market's *real* outcome produced skill **−4.47** (Brier 0.613 vs
+  the real venue's 0.112) — not evidence of no edge, but a direct measurement
+  of how disconnected a synthetic-reference forecast is from an outcome that
+  actually happened. `px-replay`'s "real recorded data" section runs this
+  today, against `recordings/polymarket_sample.csv` (both markets' real
+  resolutions fetched from Polymarket's API after they closed) and prints
+  that caveat inline rather than leaving the number to misread.
+- **Full L2 depth**, not just the touch. `tools/px-record` now writes every
+  price level the venue's public book endpoint returns to a second file
+  (`{output}.l2.{ext}`); `px_engine::recording::load_recording_l2` and
+  `set_book_from_l2_snapshot` load and replay it. `recordings/
+  polymarket_l2_sample.csv` is a real 210-snapshot capture across 7 markets;
+  `px-replay`'s "IS venue_depth CALIBRATED AGAINST A REAL BOOK?" section
+  compares real resting size near the touch against `SimConfig::default()`'s
+  assumed 400-share `venue_depth` — real depth ran higher (mean ~580-850
+  shares in the sample) and, more to the point, varied by orders of
+  magnitude snapshot to snapshot, which a single scalar cannot represent.
+- **Are YES and NO books actually complementary?** `set_complementary_book_
+  from_quote` has always assumed NO's real book is exactly `1 - YES`'s,
+  because this repo only ever polled one side. `tools/px-record` now polls
+  both; `px_engine::recording::complementarity_error` checks the assumption
+  against `recordings/polymarket_yesno_sample.csv` (330 real snapshots, 10
+  markets, both sides). Verdict: the assumption holds — mean deviation 0.0001
+  (a fraction of a tick) across 150 matched pairs, max exactly one tick. A
+  confirmatory finding, not just a corrective one: not every real measurement
+  in this pass overturned an assumption, and this is the one that didn't.
 - **Clustered standard errors in `px-score`.** The paired t-test used to treat
   every logged forecast as independent, but `px-replay` pools ~200 per-second
-  forecasts from each of 60 simulated seeds — correlated within a seed, not
-  across 12,000 independent draws. `Scorecard::t_stat_clustered` (Cameron &
-  Miller 2015 CR1, specialised to a simple mean, one cluster per seed) is what
+  forecasts from each simulated seed — correlated within a seed, not across
+  independent draws. `Scorecard::t_stat_clustered` (Cameron & Miller 2015
+  CR1, specialised to a simple mean, one cluster per seed) is what
   `has_edge()` actually gates on now; `t_stat` (the naive one) is kept
-  alongside it specifically so the gap is visible. Run for real against the
-  pooled 60-seed scorecard: naive t = **+10.21** (reads as confidently worse
-  than the venue), clustered t = **+1.00** (genuinely inconclusive, once you
-  count independent evidence instead of correlated readings of it) — the
-  naive statistic was overstating confidence by roughly 10x.
+  alongside it specifically so the gap is visible. At 60 seeds the clustered
+  result was genuinely inconclusive (t = +1.00, underpowered rather than
+  negative); at 500 seeds — cheap to run, ~10s — it resolves: clustered
+  t = **+4.73**, skill **−0.0898**, clearly significant and clearly on the
+  "worse than the venue" side. The naive statistic (t = +44.40 at 500 seeds)
+  was overstating that same conclusion's confidence by roughly 10x throughout.
 - **A LICENSE** — MIT, matching the sibling `parallax-ui` repo.
 
 ---

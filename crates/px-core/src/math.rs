@@ -16,14 +16,23 @@
 
 const LN2_HI: f64 = 6.931_471_803_691_238e-1;
 const LN2_LO: f64 = 1.908_214_929_270_587_7e-10;
-const INV_LN2: f64 = 1.442_695_040_888_963_4;
+// `1 / ln(2)`, i.e. `log2(e)` — spelled out to the same f64 value
+// `core::f64::consts::LOG2_E` rounds to, but named for what it's used for
+// here (range-reducing `exp`'s argument), not what it equals.
+const INV_LN2: f64 = core::f64::consts::LOG2_E;
 const INV_SQRT_2PI: f64 = 0.398_942_280_401_432_7;
 
 /// e^x, accurate to ~1e-10 relative over the range we care about.
 ///
 /// Range reduction `x = k·ln2 + r`, degree-9 Taylor on `r`, then scale by `2^k`
 /// through direct exponent-field construction.
+///
+/// `k` is derived from `x`, which the two early returns above already
+/// bound to `[-745.0, 709.0]` — so `k` (via `x * INV_LN2`) is bounded to
+/// roughly `[-1075, 1024]` before either branch below ever runs, and every
+/// arithmetic op on it in this function stays well inside `i64`/`u64`.
 #[inline]
+#[allow(clippy::arithmetic_side_effects)]
 pub fn exp(x: f64) -> f64 {
     if x.is_nan() {
         return f64::NAN;
@@ -46,28 +55,33 @@ pub fn exp(x: f64) -> f64 {
     // below f64 epsilon relative to 1. Degree 9 would leave ~7e-12 relative
     // error, which is visible at the 12th significant digit and would make the
     // "does replay match production" test flaky at tight tolerances.
-    const C2: f64 = 1.0 / 2.0;
-    const C3: f64 = 1.0 / 6.0;
-    const C4: f64 = 1.0 / 24.0;
-    const C5: f64 = 1.0 / 120.0;
-    const C6: f64 = 1.0 / 720.0;
-    const C7: f64 = 1.0 / 5040.0;
-    const C8: f64 = 1.0 / 40320.0;
-    const C9: f64 = 1.0 / 362_880.0;
-    const C10: f64 = 1.0 / 3_628_800.0;
-    const C11: f64 = 1.0 / 39_916_800.0;
-    const C12: f64 = 1.0 / 479_001_600.0;
-
-    let p = 1.0
-        + r * (1.0
-            + r * (C2
-                + r * (C3
-                    + r * (C4
-                        + r * (C5
-                            + r * (C6
-                                + r * (C7
-                                    + r * (C8
-                                        + r * (C9 + r * (C10 + r * (C11 + r * C12)))))))))));
+    // Coefficients highest degree (r^12) first, so the fold below evaluates
+    // Horner's method outside-in exactly as a hand-nested
+    // `c0 + r*(c1 + r*(c2 + ...))` expression would — same operations, same
+    // order, so this is bit-for-bit identical to that form. It replaces one
+    // here on purpose: a expression nested 12 parentheses deep is not just
+    // hard to read, it is slow enough to *format* that `rustfmt` does not
+    // return in practical time on this file, which blocked `cargo fmt`
+    // across the whole workspace.
+    const COEFFS: [f64; 13] = [
+        1.0 / 479_001_600.0, // r^12
+        1.0 / 39_916_800.0,  // r^11
+        1.0 / 3_628_800.0,   // r^10
+        1.0 / 362_880.0,     // r^9
+        1.0 / 40320.0,       // r^8
+        1.0 / 5040.0,        // r^7
+        1.0 / 720.0,         // r^6
+        1.0 / 120.0,         // r^5
+        1.0 / 24.0,          // r^4
+        1.0 / 6.0,           // r^3
+        1.0 / 2.0,           // r^2
+        1.0,                 // r^1
+        1.0,                 // r^0
+    ];
+    let mut p = 0.0;
+    for c in COEFFS {
+        p = c + r * p;
+    }
 
     // 2^k by exponent-field construction. Bias is 1023.
     //
@@ -95,7 +109,12 @@ pub fn exp(x: f64) -> f64 {
 }
 
 /// Natural log, accurate to ~1e-12 relative. Returns NaN for x <= 0.
+///
+/// `e` is an 11-bit IEEE-754 exponent field masked to `0x7ff` (`[0, 2047]`)
+/// minus the `1023` bias, so it is bounded to `[-1023, 1024]` before the
+/// recentring step below can add at most `1` to it.
 #[inline]
+#[allow(clippy::arithmetic_side_effects)]
 pub fn ln(x: f64) -> f64 {
     if x <= 0.0 || x.is_nan() {
         return f64::NAN;
@@ -122,7 +141,8 @@ pub fn ln(x: f64) -> f64 {
         * (2.0
             + s2 * (2.0 / 3.0
                 + s2 * (2.0 / 5.0
-                    + s2 * (2.0 / 7.0 + s2 * (2.0 / 9.0 + s2 * (2.0 / 11.0 + s2 * (2.0 / 13.0)))))));
+                    + s2 * (2.0 / 7.0
+                        + s2 * (2.0 / 9.0 + s2 * (2.0 / 11.0 + s2 * (2.0 / 13.0)))))));
 
     (e as f64) * LN2_HI + ((e as f64) * LN2_LO + series)
 }
@@ -176,14 +196,18 @@ pub fn norm_cdf(x: f64) -> f64 {
 /// multiples for the safety margin.
 pub fn norm_ppf(p: f64) -> f64 {
     if !(p > 0.0 && p < 1.0) {
-        return if p <= 0.0 { f64::NEG_INFINITY } else { f64::INFINITY };
+        return if p <= 0.0 {
+            f64::NEG_INFINITY
+        } else {
+            f64::INFINITY
+        };
     }
 
     const A: [f64; 6] = [
         -3.969_683_028_665_376e1,
         2.209_460_984_245_205e2,
         -2.759_285_104_469_687e2,
-        1.383_577_518_672_690e2,
+        1.383_577_518_672_69e2,
         -3.066_479_806_614_716e1,
         2.506_628_277_459_239,
     ];
@@ -247,9 +271,9 @@ mod tests {
         assert!(close(exp(0.0), 1.0, 1e-15));
         assert!(close(exp(1.0), core::f64::consts::E, 1e-12));
         assert!(close(exp(-1.0), 1.0 / core::f64::consts::E, 1e-12));
-        assert!(close(exp(10.0), 22026.465_794_806_718, 1e-6));
+        assert!(close(exp(10.0), 22_026.465_794_806_718, 1e-6));
         assert!(close(exp(-10.0), 4.539_992_976_248_485e-5, 1e-15));
-        assert_eq!(exp(-1000.0), 0.0);
+        assert_eq!(exp(-1000.0).to_bits(), 0.0f64.to_bits());
         assert!(exp(1000.0).is_infinite());
     }
 
@@ -278,7 +302,7 @@ mod tests {
                 "exp({x}): ours={ours:e} libm={theirs:e}"
             );
         }
-        assert_eq!(exp(-800.0), 0.0);
+        assert_eq!(exp(-800.0).to_bits(), 0.0f64.to_bits());
     }
 
     #[test]
@@ -313,7 +337,10 @@ mod tests {
         while x < 1e6 {
             let ours = ln(x);
             let theirs = x.ln();
-            assert!((ours - theirs).abs() <= 1e-11, "ln({x}): ours={ours} libm={theirs}");
+            assert!(
+                (ours - theirs).abs() <= 1e-11,
+                "ln({x}): ours={ours} libm={theirs}"
+            );
             x *= 1.117;
         }
         assert!(ln(-1.0).is_nan());

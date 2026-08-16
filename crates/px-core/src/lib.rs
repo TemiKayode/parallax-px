@@ -227,7 +227,10 @@ mod tests {
 
     #[test]
     fn geopolitics_is_free() {
-        assert_eq!(Category::Geopolitics.taker_fee_rate(), 0.0);
+        assert_eq!(
+            Category::Geopolitics.taker_fee_rate().to_bits(),
+            0.0f64.to_bits()
+        );
     }
 
     #[test]
@@ -247,7 +250,10 @@ mod tests {
             reward_min_size: Qty::shares(50),
         };
         assert!((spec.tau_secs(Nanos::from_millis(240_000)) - 60.0).abs() < 1e-9);
-        assert_eq!(spec.tau_secs(Nanos::from_millis(400_000)), 0.0);
+        assert_eq!(
+            spec.tau_secs(Nanos::from_millis(400_000)).to_bits(),
+            0.0f64.to_bits()
+        );
         assert!(spec.is_expired(Nanos::from_millis(400_000)));
     }
 }

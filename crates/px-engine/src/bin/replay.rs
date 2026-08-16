@@ -20,7 +20,7 @@
 
 use px_engine::replay::{
     quantiles, run, seed_distribution, sweep_informed_fraction, sweep_latency, sweep_venue_lag,
-    Outage, Report, Shock, SimConfig,
+    Outage, Report, Shock, SimConfig, VenueQuoteSource,
 };
 
 fn header() {
@@ -177,18 +177,224 @@ fn main() {
     println!("Scored on forecasts alone — no orders, no execution, no capital.");
     println!("If the skill score is not positive here, no amount of execution");
     println!("engineering downstream can manufacture an edge.\n");
+
+    // Pool forecasts across many seeds: one session is far too few resolved
+    // forecasts to say anything, and 60 clusters barely clears has_edge()'s
+    // own n_clusters >= 20 gate — nowhere near enough to resolve a genuinely
+    // inconclusive result (clustered |t| ~1, well short of the |t| > 2 bar
+    // in either direction). 500 clusters tightens the cluster-robust SE by
+    // roughly sqrt(500/60) ~ 2.9x over the original run.
+    const N_SEEDS: u64 = 500;
+    let mut pooled = px_score::Scorer::new();
+    for i in 0..N_SEEDS {
+        let mut c = SimConfig::default();
+        c.seed = 0x5EED ^ i.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        for r in run(&c).scorecard_inputs {
+            pooled.record(r);
+        }
+    }
+    let card = pooled.score();
+    print!("{}", px_score::report(&card));
+
+    // ---------------------------------------------------------------
+    // DOES THE MODEL BEAT THE VENUE MID? (real recorded data, not synthetic)
+    // ---------------------------------------------------------------
+    println!("\n\n{}", "=".repeat(72));
+    println!("DOES THE MODEL BEAT THE VENUE MID? (real recorded data)");
+    println!("{}\n", "=".repeat(72));
+    println!(
+        "Same question, scored against tools/px-record's real captured venue quotes\ninstead of a synthetic venue — see recordings/README.md for what was captured."
+    );
+    println!(
+        "The reference price feeding the model's own belief is still synthetic GBM\n(recording.rs's module doc explains why); only the venue side is real here.\n"
+    );
     {
-        // Pool forecasts across many seeds: one session is far too few
-        // resolved forecasts to say anything.
-        let mut pooled = px_score::Scorer::new();
-        for i in 0..60u64 {
-            let mut c = SimConfig::default();
-            c.seed = 0x5EED ^ i.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-            for r in run(&c).scorecard_inputs {
-                pooled.record(r);
+        // Each entry is one genuinely independent real market instance —
+        // the actual unit of evidence, not a seed. `cluster_id` is
+        // assigned per *market*, not per run, specifically so pooling
+        // several recordings' worth of real data does not repeat the
+        // mistake this whole feature exists to catch: treating repeated
+        // or correlated readings as independent ones.
+        //
+        // `real_outcome` is the market's *actual* resolution — fetched
+        // from Polymarket's Gamma API after both markets closed
+        // (`umaResolutionStatus: "resolved"`, `outcomePrices: ["1","0"]`
+        // for `["Up","Down"]` on both). This matters more than it looks:
+        // `run()`'s own `outcome_yes` is computed from the *synthetic*
+        // reference path's settlement TWAP against `cfg.strike`, which
+        // has nothing to do with what a replayed real market actually
+        // did. Scoring against that synthetic outcome instead of the real
+        // one was tried first here and produced a base rate of 0% (both
+        // markets reading as resolved NO) against real quotes that were
+        // visibly trading up near 0.98-0.999 — the giveaway that the
+        // outcome, not just the forecast, needs to be real too.
+        let real_markets: &[(&str, u64, bool)] = &[("btc_4h", 1, true), ("btc_1h", 2, true)];
+        let raw = include_str!("../../../../recordings/polymarket_sample.csv");
+        let mut pooled_real = px_score::Scorer::new();
+        let mut n_markets = 0usize;
+        for (market, cluster_id, real_outcome) in real_markets {
+            let quotes = px_engine::recording::load_recording(raw, market);
+            if quotes.len() < 20 {
+                println!(
+                    "  skipping {market}: only {} recorded rows, too thin to replay",
+                    quotes.len()
+                );
+                continue;
+            }
+            let span_s = quotes.last().map(|q| q.t_s).unwrap_or(0.0);
+            let mut cfg = SimConfig::default();
+            cfg.duration_s = span_s;
+            cfg.expiry_s = span_s;
+            cfg.venue_quotes = VenueQuoteSource::Recorded(quotes);
+            let r = run(&cfg);
+            for mut f in r.scorecard_inputs {
+                f.forecast.cluster_id = *cluster_id;
+                f.outcome = *real_outcome;
+                pooled_real.record(f);
+            }
+            n_markets += 1;
+            println!(
+                "  {market}: {:.0}s replayed, {} fills, {} forecasts logged, real outcome = {}",
+                span_s,
+                r.fills.len(),
+                r.stats.ticks,
+                if *real_outcome { "Up" } else { "Down" }
+            );
+        }
+        println!("\n{n_markets} real market instance(s) pooled below.\n");
+        let real_card = pooled_real.score();
+        print!("{}", px_score::report(&real_card));
+        println!(
+            "\n(n_clusters here is the count of *distinct recorded market instances*, not\nseeds — {n_markets} is nowhere near has_edge()'s own n_clusters >= 20 bar, so this\nis a real, honestly-reported measurement, not a significance claim. It is what\nrecording more independent real markets — the actual open item — would build on.)"
+        );
+        if real_card.skill_score < -1.0 {
+            println!(
+                "\nRead this skill score carefully: it is NOT evidence the strategy has no edge.\nThe model's own belief here is still computed from the synthetic GBM reference\npath, which has no relationship to what BTC actually did during this real\nwindow — this number is what happens when you score a forecast against a real\noutcome after disconnecting it from the real world first. It quantifies why\nthe synthetic reference feed is not a nice-to-have: until it is replaced with\na real one, no comparison against real venue quotes or real outcomes means\nwhat it looks like it means."
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Is SimConfig::venue_depth calibrated against a real book?
+    // ---------------------------------------------------------------
+    println!("\n\n{}", "=".repeat(72));
+    println!("IS venue_depth CALIBRATED AGAINST A REAL BOOK?");
+    println!("{}\n", "=".repeat(72));
+    {
+        let raw_l2 = include_str!("../../../../recordings/polymarket_l2_sample.csv");
+        let snaps = px_engine::recording::load_recording_l2(raw_l2, "btc-updown-5m-1786860300");
+        if snaps.is_empty() {
+            println!("  no L2 recording available — skipped.");
+        } else {
+            // Depth resting within the assumed half-spread's reach of the
+            // touch, each side, averaged over every real snapshot — the
+            // real-world number `SimConfig::default().venue_depth`
+            // (400 shares) stands in for.
+            let half_spread_px = SimConfig::default().venue_half_spread as f64 / 1_000_000.0;
+            let mut bid_depth_sum = 0.0;
+            let mut ask_depth_sum = 0.0;
+            for snap in &snaps {
+                let Some(best_bid) = snap.bids.first().map(|l| l.price) else {
+                    continue;
+                };
+                let Some(best_ask) = snap.asks.first().map(|l| l.price) else {
+                    continue;
+                };
+                bid_depth_sum += snap
+                    .bids
+                    .iter()
+                    .filter(|l| best_bid - l.price <= half_spread_px)
+                    .map(|l| l.size)
+                    .sum::<f64>();
+                ask_depth_sum += snap
+                    .asks
+                    .iter()
+                    .filter(|l| l.price - best_ask <= half_spread_px)
+                    .map(|l| l.size)
+                    .sum::<f64>();
+            }
+            let n = snaps.len() as f64;
+            let assumed = SimConfig::default().venue_depth.as_f64();
+            println!(
+                "  {} real snapshots of btc-updown-5m-1786860300 (see recordings/README.md)",
+                snaps.len()
+            );
+            println!(
+                "  assumed venue_depth (SimConfig::default):  {assumed:>10.1} shares per side"
+            );
+            println!(
+                "  observed, within {:.0}c of the touch:  bid {:>10.1}   ask {:>10.1}  (mean per snapshot)",
+                half_spread_px * 100.0,
+                bid_depth_sum / n,
+                ask_depth_sum / n
+            );
+            println!(
+                "\n  Real resting size near the touch on a genuinely thin, low-volume market\n  varies enormously snapshot to snapshot (a handful of shares to tens of\n  thousands) — a single scalar `venue_depth` cannot represent that range,\n  which is itself the finding: queue-position calibration needs a\n  distribution, not a constant, and now there is real data to build one\n  from instead of guessing at it."
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Are YES and NO books actually complementary in practice?
+    // ---------------------------------------------------------------
+    println!("\n\n{}", "=".repeat(72));
+    println!("ARE YES AND NO REAL BOOKS ACTUALLY COMPLEMENTARY?");
+    println!("{}\n", "=".repeat(72));
+    println!(
+        "recording.rs's set_complementary_book_from_quote assumes NO's book is exactly\n1 minus YES's — checked here against tools/px-record's -no output, both sides\npolled independently for the same markets (recordings/README.md).\n"
+    );
+    {
+        let raw = include_str!("../../../../recordings/polymarket_yesno_sample.csv");
+        let markets = [
+            "btc-updown-4h-1786852800",
+            "eth-updown-4h-1786852800",
+            "sol-updown-4h-1786852800",
+            "xrp-updown-4h-1786852800",
+            "btc-updown-5m-1786860300",
+            "btc-updown-15m-1786858200",
+            "bitcoin-up-or-down-august-16-2026-1am-et",
+            "ethereum-up-or-down-august-16-2026-1am-et",
+            "solana-up-or-down-august-16-2026-1am-et",
+            "xrp-up-or-down-august-16-2026-1am-et",
+        ];
+        let mut all_errors: Vec<(f64, f64)> = Vec::new();
+        for market in markets {
+            let no_market = format!("{market}-no");
+            let errors = px_engine::recording::complementarity_error(raw, market, &no_market);
+            if !errors.is_empty() {
+                all_errors.extend(errors);
             }
         }
-        print!("{}", px_score::report(&pooled.score()));
+        if all_errors.is_empty() {
+            println!("  no matched YES/NO pairs available — skipped.");
+        } else {
+            let n = all_errors.len() as f64;
+            let mean_bid = all_errors.iter().map(|(b, _)| b).sum::<f64>() / n;
+            let mean_ask = all_errors.iter().map(|(_, a)| a).sum::<f64>() / n;
+            let max_bid = all_errors.iter().map(|(b, _)| *b).fold(0.0, f64::max);
+            let max_ask = all_errors.iter().map(|(_, a)| *a).fold(0.0, f64::max);
+            println!(
+                "  {} matched real YES/NO snapshot pairs across {} markets",
+                all_errors.len(),
+                markets.len()
+            );
+            println!(
+                "  mean |no.bid - (1-yes.ask)| = {:>7.4}   mean |no.ask - (1-yes.bid)| = {:>7.4}",
+                mean_bid, mean_ask
+            );
+            println!(
+                "  max  |no.bid - (1-yes.ask)| = {:>7.4}   max  |no.ask - (1-yes.bid)| = {:>7.4}",
+                max_bid, max_ask
+            );
+            let verdict = if mean_bid < 0.005 && mean_ask < 0.005 {
+                "The assumption holds well in this sample — mean error under half a tick."
+            } else if mean_bid < 0.02 && mean_ask < 0.02 {
+                "Close but not exact — small, real friction between the two independently\n  quoted sides, not just rounding."
+            } else {
+                "The assumption does NOT hold cleanly here — treating NO as YES's exact\n  complement would misprice it by more than a rounding error."
+            };
+            println!("\n  {verdict}");
+        }
     }
 
     // ---------------------------------------------------------------
@@ -196,15 +402,6 @@ fn main() {
     // ---------------------------------------------------------------
     {
         use std::io::Write;
-        let mut pooled = px_score::Scorer::new();
-        for i in 0..60u64 {
-            let mut c = SimConfig::default();
-            c.seed = 0x5EED ^ i.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-            for r in run(&c).scorecard_inputs {
-                pooled.record(r);
-            }
-        }
-        let card = pooled.score();
         let baseline = run(&SimConfig::default());
 
         let charts: [(&str, String); 4] = [

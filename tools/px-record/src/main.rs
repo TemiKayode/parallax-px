@@ -14,7 +14,7 @@
 //! Defaults: `recording.csv`, 300, 3.
 
 use serde_json::Value;
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -22,12 +22,18 @@ const GAMMA_EVENTS_URL: &str = "https://gamma-api.polymarket.com/events?active=t
 const CLOB_BOOK_URL: &str = "https://clob.polymarket.com/book";
 
 /// One market worth polling: a short, stable name for the CSV `market`
-/// column (its Polymarket event slug), and the CLOB token id of its
-/// YES/"Up" outcome.
+/// column (its Polymarket event slug), and the CLOB token ids of both its
+/// YES/"Up" and NO/"Down" outcomes. `no_token` is polled and written
+/// under `{name}-no` in the same output files — see `main`'s comment on
+/// why, this is what item 5 of the "what's left" list needs: checking
+/// whether the two sides' independently-quoted books are actually
+/// complementary, rather than assuming it the way `recording.rs`'s
+/// `set_complementary_book_from_quote` currently has to.
 #[derive(Debug, Clone)]
 struct Target {
     name: String,
     yes_token: String,
+    no_token: Option<String>,
 }
 
 /// Extracts every currently active "Up or Down" crypto market from a
@@ -63,6 +69,7 @@ fn discover_targets(events: &Value) -> Vec<Target> {
         out.push(Target {
             name: slug.to_string(),
             yes_token: yes_token.clone(),
+            no_token: token_ids.get(1).cloned(),
         });
     }
     out
@@ -75,24 +82,89 @@ fn unix_now() -> f64 {
         .unwrap_or(0.0)
 }
 
-/// Best bid (max price) / best ask (min price) from a CLOB `/book`
-/// response's `bids`/`asks` level arrays. `None` if the side is empty or
-/// malformed — a momentarily one-sided book is routine on a real live
-/// book, not an error to abort a whole polling pass over.
-fn best_level(levels: &Value, want_max: bool) -> Option<(f64, f64)> {
-    let arr = levels.as_array()?;
-    let mut best: Option<(f64, f64)> = None;
-    for level in arr {
-        let price: f64 = level.get("price")?.as_str()?.parse().ok()?;
-        let size: f64 = level.get("size")?.as_str()?.parse().ok()?;
-        best = match best {
-            None => Some((price, size)),
-            Some((bp, _)) if want_max && price > bp => Some((price, size)),
-            Some((bp, _)) if !want_max && price < bp => Some((price, size)),
-            other => other,
-        };
+/// Every level on one side, sorted best-first (descending for bids,
+/// ascending for asks) — the CLOB response's own order is not documented
+/// as sorted, so this sorts explicitly rather than trusting it. A
+/// malformed individual level is dropped, not fatal to the rest.
+fn all_levels(levels: &Value, descending: bool) -> Vec<(f64, f64)> {
+    let Some(arr) = levels.as_array() else {
+        return Vec::new();
+    };
+    let mut out: Vec<(f64, f64)> = arr
+        .iter()
+        .filter_map(|level| {
+            let price: f64 = level.get("price")?.as_str()?.parse().ok()?;
+            let size: f64 = level.get("size")?.as_str()?.parse().ok()?;
+            if price.is_finite() && size.is_finite() {
+                Some((price, size))
+            } else {
+                None
+            }
+        })
+        .collect();
+    out.sort_by(|a, b| {
+        if descending {
+            b.0.partial_cmp(&a.0)
+        } else {
+            a.0.partial_cmp(&b.0)
+        }
+        .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    out
+}
+
+/// `px_engine::recording::load_recording_l2`'s level-list format:
+/// `price:size,price:size,...`.
+fn format_levels(levels: &[(f64, f64)]) -> String {
+    levels
+        .iter()
+        .map(|(p, s)| format!("{p}:{s}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Derives the L2-depth output path from the touch-only one: `x.csv` ->
+/// `x.l2.csv`, or `x.l2.csv` appended if there is no extension to split
+/// on. Keeps the CLI to one output argument rather than two.
+fn l2_path(base: &str) -> String {
+    match base.rsplit_once('.') {
+        Some((stem, ext)) => format!("{stem}.l2.{ext}"),
+        None => format!("{base}.l2.csv"),
     }
-    best
+}
+
+/// Fetches one token's real book and appends it to both output files
+/// under `market_label` — the one piece of per-token logic `main`'s loop
+/// needs twice (YES, and optionally NO). Returns `Ok(true)` if a touch
+/// row was written (both sides had at least one level), `Ok(false)` if
+/// the book was one-sided (routine, not an error) or malformed, and
+/// `Err` only on an actual request failure.
+fn fetch_and_record(
+    client: &reqwest::blocking::Client,
+    token_id: &str,
+    market_label: &str,
+    file: &mut File,
+    l2_file: &mut File,
+) -> Result<bool, reqwest::Error> {
+    let url = format!("{CLOB_BOOK_URL}?token_id={token_id}");
+    let book: Value = client.get(&url).send()?.json()?;
+    let ts = unix_now();
+    let bids = all_levels(book.get("bids").unwrap_or(&Value::Null), true);
+    let asks = all_levels(book.get("asks").unwrap_or(&Value::Null), false);
+    let mut wrote_touch = false;
+    if let (Some(&(bp, bs)), Some(&(ap, asz))) = (bids.first(), asks.first()) {
+        let row = format!("{ts:.3},{market_label},{bp},{bs},{ap},{asz}\n");
+        wrote_touch = file.write_all(row.as_bytes()).is_ok();
+    }
+    if !bids.is_empty() {
+        let row = format!("{ts:.3},{market_label},bid,{}\n", format_levels(&bids));
+        let _ = l2_file.write_all(row.as_bytes());
+    }
+    if !asks.is_empty() {
+        let row = format!("{ts:.3},{market_label},ask,{}\n", format_levels(&asks));
+        let _ = l2_file.write_all(row.as_bytes());
+    }
+    Ok(wrote_touch)
 }
 
 fn main() {
@@ -127,8 +199,9 @@ fn main() {
     for t in &targets {
         println!("  {} ({})", t.name, t.yes_token);
     }
+    let l2_out_path = l2_path(&out_path);
     println!(
-        "Writing to {out_path} every {interval_secs}s for {duration_secs}s. Read-only — no order is ever placed, no credentials required."
+        "Writing touch quotes to {out_path} and full depth to {l2_out_path}\nevery {interval_secs}s for {duration_secs}s. Read-only — no order is ever placed, no credentials required."
     );
 
     let mut file = OpenOptions::new()
@@ -140,6 +213,15 @@ fn main() {
             std::process::exit(1);
         });
     let _ = writeln!(file, "# t_unix,market,bid,bid_size,ask,ask_size");
+    let mut l2_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&l2_out_path)
+        .unwrap_or_else(|e| {
+            eprintln!("failed to open {l2_out_path}: {e}");
+            std::process::exit(1);
+        });
+    let _ = writeln!(l2_file, "# t_unix,market,side,price:size,price:size,...");
 
     let start = Instant::now();
     let mut n = 0u64;
@@ -147,33 +229,34 @@ fn main() {
     while start.elapsed() < Duration::from_secs(duration_secs) {
         let tick_start = Instant::now();
         for t in &targets {
-            let url = format!("{CLOB_BOOK_URL}?token_id={}", t.yes_token);
-            match client.get(&url).send().and_then(|r| r.json::<Value>()) {
-                Ok(book) => {
-                    let bid = best_level(book.get("bids").unwrap_or(&Value::Null), true);
-                    let ask = best_level(book.get("asks").unwrap_or(&Value::Null), false);
-                    if let (Some((bp, bs)), Some((ap, asz))) = (bid, ask) {
-                        let row = format!(
-                            "{:.3},{},{},{},{},{}\n",
-                            unix_now(),
-                            t.name,
-                            bp,
-                            bs,
-                            ap,
-                            asz
-                        );
-                        if file.write_all(row.as_bytes()).is_ok() {
-                            n += 1;
-                        }
-                    }
-                }
+            match fetch_and_record(&client, &t.yes_token, &t.name, &mut file, &mut l2_file) {
+                Ok(true) => n += 1,
+                Ok(false) => {}
                 Err(e) => {
                     errors += 1;
                     eprintln!("fetch failed for {}: {e}", t.name);
                 }
             }
+            // The NO/"Down" side, under `{name}-no` — polled and recorded
+            // through the exact same path as YES, so the two are directly
+            // comparable: were this repo's real quotes actually
+            // complementary, or was that always just a convenient
+            // assumption? (`recording.rs`'s module doc on why the
+            // assumption exists in the first place.)
+            if let Some(no_token) = &t.no_token {
+                let no_name = format!("{}-no", t.name);
+                match fetch_and_record(&client, no_token, &no_name, &mut file, &mut l2_file) {
+                    Ok(true) => n += 1,
+                    Ok(false) => {}
+                    Err(e) => {
+                        errors += 1;
+                        eprintln!("fetch failed for {no_name}: {e}");
+                    }
+                }
+            }
         }
         let _ = file.flush();
+        let _ = l2_file.flush();
         println!("recorded so far: {n} snapshots, {errors} fetch errors");
         let elapsed = tick_start.elapsed();
         if elapsed < Duration::from_secs(interval_secs) {
@@ -182,7 +265,7 @@ fn main() {
     }
     println!("Done. {n} snapshots written to {out_path} ({errors} fetch errors).");
     println!(
-        "Load with px_engine::recording::load_recording, filtering on the market slug printed above."
+        "Load touch quotes with px_engine::recording::load_recording, full depth from\n{l2_out_path} with load_recording_l2 — filter both on the market slug printed above."
     );
 }
 
@@ -222,8 +305,25 @@ mod tests {
         assert_eq!(targets.len(), 2);
         assert_eq!(targets[0].name, "btc-updown-4h-1786838400");
         assert_eq!(targets[0].yes_token, "111");
+        assert_eq!(targets[0].no_token.as_deref(), Some("222"));
         assert_eq!(targets[1].name, "eth-updown-4h-1786838400");
         assert_eq!(targets[1].yes_token, "555");
+        assert_eq!(targets[1].no_token.as_deref(), Some("666"));
+    }
+
+    #[test]
+    fn a_single_outcome_token_leaves_no_token_absent_not_fatal() {
+        let events = serde_json::json!([
+            {
+                "title": "BTC Up or Down",
+                "slug": "solo",
+                "markets": [{"clobTokenIds": "[\"only-one\"]"}]
+            }
+        ]);
+        let targets = discover_targets(&events);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].yes_token, "only-one");
+        assert!(targets[0].no_token.is_none());
     }
 
     #[test]
@@ -243,19 +343,49 @@ mod tests {
     }
 
     #[test]
-    fn best_level_picks_max_for_bids_and_min_for_asks() {
-        let levels = serde_json::json!([
-            {"price": "0.55", "size": "10"},
-            {"price": "0.60", "size": "20"},
-            {"price": "0.52", "size": "5"},
-        ]);
-        assert_eq!(best_level(&levels, true), Some((0.60, 20.0)));
-        assert_eq!(best_level(&levels, false), Some((0.52, 5.0)));
+    fn all_levels_of_an_empty_side_is_empty() {
+        assert!(all_levels(&serde_json::json!([]), true).is_empty());
+        assert!(all_levels(&Value::Null, true).is_empty());
     }
 
     #[test]
-    fn best_level_of_an_empty_side_is_none() {
-        assert_eq!(best_level(&serde_json::json!([]), true), None);
-        assert_eq!(best_level(&Value::Null, true), None);
+    fn all_levels_sorts_bids_descending_and_asks_ascending() {
+        let levels = serde_json::json!([
+            {"price": "0.52", "size": "5"},
+            {"price": "0.60", "size": "20"},
+            {"price": "0.55", "size": "10"},
+        ]);
+        assert_eq!(
+            all_levels(&levels, true),
+            vec![(0.60, 20.0), (0.55, 10.0), (0.52, 5.0)]
+        );
+        assert_eq!(
+            all_levels(&levels, false),
+            vec![(0.52, 5.0), (0.55, 10.0), (0.60, 20.0)]
+        );
+    }
+
+    #[test]
+    fn all_levels_drops_malformed_entries_not_the_whole_side() {
+        let levels = serde_json::json!([
+            {"price": "0.52", "size": "5"},
+            {"price": "not a number", "size": "10"},
+            {"size": "10"},
+            {"price": "0.55", "size": "10"},
+        ]);
+        assert_eq!(all_levels(&levels, true), vec![(0.55, 10.0), (0.52, 5.0)]);
+    }
+
+    #[test]
+    fn format_levels_matches_load_recording_l2s_expected_syntax() {
+        assert_eq!(format_levels(&[(0.55, 100.0), (0.54, 200.0)]), "0.55:100,0.54:200");
+        assert_eq!(format_levels(&[]), "");
+    }
+
+    #[test]
+    fn l2_path_inserts_before_the_extension() {
+        assert_eq!(l2_path("recording.csv"), "recording.l2.csv");
+        assert_eq!(l2_path("dir/recording.csv"), "dir/recording.l2.csv");
+        assert_eq!(l2_path("no_extension"), "no_extension.l2.csv");
     }
 }

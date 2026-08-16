@@ -44,14 +44,24 @@ impl Px {
     }
 
     /// Round *down* to the market's tick grid (used for bids).
+    ///
+    /// `self.0 - rem_euclid(tick)` cannot overflow: `rem_euclid` on a
+    /// positive `tick` returns a value in `[0, tick)`, so this only ever
+    /// subtracts something smaller in magnitude than `self.0` itself.
     #[inline(always)]
+    #[allow(clippy::arithmetic_side_effects)]
     pub fn floor_to_tick(self, tick: i32) -> Px {
         debug_assert!(tick > 0);
         Px(self.0 - self.0.rem_euclid(tick))
     }
 
     /// Round *up* to the market's tick grid (used for asks).
+    ///
+    /// `r` is in `[1, tick)` here (the `r == 0` case returns above), and
+    /// `Px` stays within `[0, 1_000_000]` in every construction path this
+    /// crate uses — `self.0 + (tick - r)` cannot reach `i32::MAX`.
     #[inline(always)]
+    #[allow(clippy::arithmetic_side_effects)]
     pub fn ceil_to_tick(self, tick: i32) -> Px {
         debug_assert!(tick > 0);
         let r = self.0.rem_euclid(tick);
@@ -65,7 +75,13 @@ impl Px {
     /// The complementary outcome's price. Buying NO at 48c is economically
     /// identical to selling YES at 52c; the selector relies on this identity
     /// to choose the cheaper leg.
+    ///
+    /// Every `Px` this crate constructs comes from a validated path
+    /// (`from_f64`'s `clamp_unit`, or a literal already inside
+    /// `[0, 1_000_000]`) — `1_000_000 - self.0` cannot underflow an `i32`
+    /// for a value actually reachable from that domain.
     #[inline(always)]
+    #[allow(clippy::arithmetic_side_effects)]
     pub fn complement(self) -> Px {
         Px(1_000_000 - self.0)
     }
@@ -85,7 +101,11 @@ impl Px {
 impl Qty {
     pub const ZERO: Qty = Qty(0);
 
+    /// `n` shares beyond roughly 9.2 trillion would overflow `i64` here —
+    /// unreachable for any real order or book level (`MAX_LEVEL_QTY` in
+    /// `book.rs` caps a single level six orders of magnitude below that).
     #[inline(always)]
+    #[allow(clippy::arithmetic_side_effects)]
     pub fn shares(n: i64) -> Qty {
         Qty(n * PPM)
     }
@@ -118,7 +138,10 @@ impl Usd {
         self.0 as f64 * 1e-6
     }
 
+    /// Same headroom argument as `Qty::shares`: overflow needs a notional
+    /// beyond roughly $9.2 trillion.
     #[inline(always)]
+    #[allow(clippy::arithmetic_side_effects)]
     pub fn dollars(n: i64) -> Usd {
         Usd(n * PPM)
     }
@@ -150,7 +173,11 @@ impl Prob {
         Px(self.0)
     }
 
+    /// Same domain argument as `Px::complement`: every `Prob` this crate
+    /// constructs goes through `clamp_unit`, so `self.0` is in
+    /// `[0, 1_000_000]` and this cannot underflow.
     #[inline(always)]
+    #[allow(clippy::arithmetic_side_effects)]
     pub fn complement(self) -> Prob {
         Prob(1_000_000 - self.0)
     }
@@ -158,7 +185,12 @@ impl Prob {
 
 /// `px * qty` -> notional. Both are 1e-6 scaled, so the raw product is 1e-12;
 /// we do the multiply in i128 to avoid overflow on large sizes and then rescale.
+/// The multiply and the final `as i64` narrowing are both bounded by the same
+/// domain invariants `Px`/`Qty` already carry (price in `[0, 1_000_000]`,
+/// size under `MAX_LEVEL_QTY`) — the i128 widening exists precisely so this
+/// arithmetic has headroom the narrower types alone would not.
 #[inline(always)]
+#[allow(clippy::arithmetic_side_effects)]
 pub fn notional(px: Px, qty: Qty) -> Usd {
     let raw = (px.0 as i128) * (qty.0 as i128);
     Usd((raw / (PPM as i128)) as i64)
@@ -166,14 +198,22 @@ pub fn notional(px: Px, qty: Qty) -> Usd {
 
 /// Signed difference between two prices, in micro-dollars. This is the unit the
 /// edge calculator works in: "9 cents of edge" is `90_000`.
+///
+/// Both prices live in `[0, 1_000_000]` by construction, so the difference
+/// is bounded well inside `i32`.
 #[inline(always)]
+#[allow(clippy::arithmetic_side_effects)]
 pub fn spread(a: Px, b: Px) -> i32 {
     a.0 - b.0
 }
 
 impl core::ops::Add for Usd {
     type Output = Usd;
+    /// Unchecked by design: `Usd` is a running cash/notional accumulator on
+    /// the hot path, and a position or session P&L reaching `i64`'s ~$9.2
+    /// quintillion bound is not a real scenario this system trades in.
     #[inline(always)]
+    #[allow(clippy::arithmetic_side_effects)]
     fn add(self, rhs: Usd) -> Usd {
         Usd(self.0 + rhs.0)
     }
@@ -181,7 +221,10 @@ impl core::ops::Add for Usd {
 
 impl core::ops::Sub for Usd {
     type Output = Usd;
+    /// Same reasoning as `Add` above — deliberately unchecked on the hot
+    /// path, bounded in every scenario this system actually trades.
     #[inline(always)]
+    #[allow(clippy::arithmetic_side_effects)]
     fn sub(self, rhs: Usd) -> Usd {
         Usd(self.0 - rhs.0)
     }
@@ -189,7 +232,11 @@ impl core::ops::Sub for Usd {
 
 impl core::ops::Add for Qty {
     type Output = Qty;
+    /// Unchecked by design, same as `Usd::add`: `MAX_LEVEL_QTY` in
+    /// `book.rs` already bounds any single level six orders of magnitude
+    /// below where this could overflow.
     #[inline(always)]
+    #[allow(clippy::arithmetic_side_effects)]
     fn add(self, rhs: Qty) -> Qty {
         Qty(self.0 + rhs.0)
     }
@@ -198,6 +245,7 @@ impl core::ops::Add for Qty {
 impl core::ops::Sub for Qty {
     type Output = Qty;
     #[inline(always)]
+    #[allow(clippy::arithmetic_side_effects)]
     fn sub(self, rhs: Qty) -> Qty {
         Qty(self.0 - rhs.0)
     }

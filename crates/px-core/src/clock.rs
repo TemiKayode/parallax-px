@@ -14,7 +14,11 @@ impl Nanos {
 
     #[inline(always)]
     pub fn from_millis(ms: u64) -> Nanos {
-        Nanos(ms * 1_000_000)
+        // Saturating, not wrapping: an absurd `ms` (a config typo, a
+        // corrupted duration) must clamp to "very far in the future"
+        // rather than wrap into "very soon" — the same reasoning `since`
+        // below already applies to subtraction.
+        Nanos(ms.saturating_mul(1_000_000))
     }
 
     #[inline(always)]
@@ -45,7 +49,10 @@ impl core::ops::Add for Nanos {
     type Output = Nanos;
     #[inline(always)]
     fn add(self, rhs: Nanos) -> Nanos {
-        Nanos(self.0 + rhs.0)
+        // Saturating for the same reason `since` is: a wrapped timestamp
+        // silently becomes a *small* one, which is the one failure mode a
+        // monotonic clock must never produce.
+        Nanos(self.0.saturating_add(rhs.0))
     }
 }
 
@@ -86,7 +93,7 @@ impl ReplayClock {
         self.t.set(t.0);
     }
     pub fn advance(&self, d: Nanos) {
-        self.t.set(self.t.get() + d.0);
+        self.t.set(self.t.get().saturating_add(d.0));
     }
 }
 

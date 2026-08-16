@@ -36,6 +36,25 @@
 //! silently assumed — a fuller replay (a genuinely independent recorded
 //! reference feed, both sides of the book recorded directly) is future
 //! work, not something this claims to already do.
+//!
+//! # `run()`'s `outcome_yes` is still synthetic — score against it with care
+//!
+//! `Report::outcome_yes` is computed from the *synthetic* reference
+//! path's settlement TWAP against `cfg.strike` (`replay.rs`,
+//! `outcome_yes = settle_twap > cfg.strike`), regardless of
+//! `venue_quotes`. When replaying a real recording of a market that has
+//! actually settled, that is the wrong outcome to score forecasts
+//! against — it answers "what would a random synthetic path have
+//! settled to," not "what did this real market actually resolve." This
+//! was not theoretical: the first attempt at scoring
+//! `recordings/polymarket_sample.csv` this way produced a base rate of
+//! 0% (both recorded markets reading as resolved NO) against real quotes
+//! that were visibly trading up near 0.98-0.999 — the tell that the
+//! *outcome*, not just the forecast, needs to come from outside `run()`
+//! when the venue is real. `px-replay`'s "real recorded data" section
+//! fetches each market's actual resolution from Polymarket's API after
+//! the fact and overwrites `Resolved::outcome` with it before scoring;
+//! any other caller replaying a settled recording needs to do the same.
 
 use px_core::{DenseBook, Px, Qty, Side};
 
@@ -66,6 +85,26 @@ pub struct RecordedQuote {
 /// transient parse hiccup at capture time — must not discard an
 /// otherwise-good recording.
 pub fn load_recording(text: &str, market: &str) -> Vec<RecordedQuote> {
+    let rows = parse_quote_rows(text, market);
+    let Some(&(t0, _)) = rows.first() else {
+        return Vec::new();
+    };
+    rows.into_iter()
+        .map(|(_, mut q)| {
+            q.t_s -= t0;
+            q
+        })
+        .collect()
+}
+
+/// Shared parsing step behind `load_recording` and `complementarity_error`
+/// — sorted `(t_unix, RecordedQuote)` pairs with `t_s` still equal to the
+/// *absolute* recorded time, not yet normalised to start at 0. Kept
+/// separate specifically so `complementarity_error` can compare two
+/// markets' recordings against a shared clock; `load_recording` on its
+/// own has no reason to expose absolute time, since every other caller
+/// only ever replays one market's recording against its own start.
+fn parse_quote_rows(text: &str, market: &str) -> Vec<(f64, RecordedQuote)> {
     let mut rows: Vec<(f64, RecordedQuote)> = Vec::new();
     for line in text.lines() {
         let line = line.trim();
@@ -98,15 +137,7 @@ pub fn load_recording(text: &str, market: &str) -> Vec<RecordedQuote> {
         ));
     }
     rows.sort_by(|a, b| a.0.total_cmp(&b.0));
-    let Some(&(t0, _)) = rows.first() else {
-        return Vec::new();
-    };
-    rows.into_iter()
-        .map(|(_, mut q)| {
-            q.t_s -= t0;
-            q
-        })
-        .collect()
+    rows
 }
 
 /// The most recent recorded quote at or before `t` — `None` only if `t`
@@ -135,6 +166,149 @@ pub fn lookup(quotes: &[RecordedQuote], t: f64) -> Option<RecordedQuote> {
 #[inline]
 fn qty_from_f64(shares: f64) -> Qty {
     Qty((shares.max(0.0) * 1_000_000.0).round() as i64)
+}
+
+/// One real price level: what `RecordedQuote` reduces the whole book to
+/// (the touch) is really the first entry of a list of these.
+#[derive(Clone, Copy, Debug)]
+pub struct RecordedLevel {
+    pub price: f64,
+    pub size: f64,
+}
+
+/// Both sides of a real venue's book at one instant, at full depth —
+/// everything the public snapshot endpoint returned, not just the touch.
+/// `RecordedQuote` (best bid/ask only) is what this repo's shipped
+/// sample recording uses; this is for the queue-position-calibration
+/// question `RecordedQuote` structurally cannot answer, since a resting
+/// order's real fill probability depends on how much size sits ahead of
+/// it, not just on where the touch is.
+#[derive(Clone, Debug, Default)]
+pub struct RecordedBookSnapshot {
+    pub t_s: f64,
+    /// Best price first (descending).
+    pub bids: Vec<RecordedLevel>,
+    /// Best price first (ascending).
+    pub asks: Vec<RecordedLevel>,
+}
+
+/// Parses a full-depth recording. Two rows per snapshot, one per side:
+/// `t_unix,market,side,price:size,price:size,...` (`side` is `bid` or
+/// `ask`). Rows for the same `market` at the same `t_unix` (to
+/// microsecond tolerance — both rows come from the same polling pass)
+/// are merged into one `RecordedBookSnapshot`. Same tolerance as
+/// `load_recording`: a malformed row, or a malformed individual level
+/// within an otherwise-good row, is skipped rather than discarding the
+/// whole recording.
+pub fn load_recording_l2(text: &str, market: &str) -> Vec<RecordedBookSnapshot> {
+    let mut rows: Vec<(f64, bool, Vec<RecordedLevel>)> = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut cols = line.splitn(4, ',');
+        let (Some(t_str), Some(m), Some(side_str), Some(rest)) =
+            (cols.next(), cols.next(), cols.next(), cols.next())
+        else {
+            continue;
+        };
+        if m != market {
+            continue;
+        }
+        let Ok(t_unix) = t_str.trim().parse::<f64>() else {
+            continue;
+        };
+        if !t_unix.is_finite() {
+            continue;
+        }
+        let is_bid = match side_str.trim() {
+            "bid" => true,
+            "ask" => false,
+            _ => continue,
+        };
+        let mut levels = Vec::new();
+        for level_str in rest.split(',') {
+            let mut parts = level_str.trim().splitn(2, ':');
+            let (Some(p), Some(s)) = (parts.next(), parts.next()) else {
+                continue;
+            };
+            let (Ok(price), Ok(size)) = (p.trim().parse::<f64>(), s.trim().parse::<f64>()) else {
+                continue;
+            };
+            if price.is_finite() && size.is_finite() {
+                levels.push(RecordedLevel { price, size });
+            }
+        }
+        rows.push((t_unix, is_bid, levels));
+    }
+    rows.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let Some(&(t0, _, _)) = rows.first() else {
+        return Vec::new();
+    };
+
+    let mut snapshots: Vec<RecordedBookSnapshot> = Vec::new();
+    for (t_unix, is_bid, levels) in rows {
+        let t_s = t_unix - t0;
+        match snapshots.last_mut() {
+            Some(last) if (last.t_s - t_s).abs() < 1e-3 => {
+                if is_bid {
+                    last.bids = levels;
+                } else {
+                    last.asks = levels;
+                }
+            }
+            _ => {
+                let mut snap = RecordedBookSnapshot {
+                    t_s,
+                    ..Default::default()
+                };
+                if is_bid {
+                    snap.bids = levels;
+                } else {
+                    snap.asks = levels;
+                }
+                snapshots.push(snap);
+            }
+        }
+    }
+    snapshots
+}
+
+/// Same "hold the last known snapshot forward" semantics as `lookup`.
+pub fn lookup_l2(snapshots: &[RecordedBookSnapshot], t: f64) -> Option<&RecordedBookSnapshot> {
+    if snapshots.is_empty() || t < snapshots[0].t_s {
+        return None;
+    }
+    let mut lo = 0usize;
+    let mut hi = snapshots.len();
+    while lo + 1 < hi {
+        let mid = (lo + hi) / 2;
+        if snapshots[mid].t_s <= t {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    snapshots.get(lo)
+}
+
+/// Sets every real recorded level on `book`'s YES side — full depth,
+/// not just the touch `set_book_from_quote` places.
+pub fn set_book_from_l2_snapshot(book: &mut DenseBook, snap: &RecordedBookSnapshot) {
+    book.clear();
+    for lvl in &snap.bids {
+        let px = Px::from_f64(lvl.price);
+        if px.0 > 0 {
+            book.set_level(Side::Bid, px, qty_from_f64(lvl.size));
+        }
+    }
+    for lvl in &snap.asks {
+        let px = Px::from_f64(lvl.price);
+        if px.0 < 1_000_000 {
+            book.set_level(Side::Ask, px, qty_from_f64(lvl.size));
+        }
+    }
 }
 
 /// Sets `book`'s touch directly from a real recorded quote (the YES
@@ -168,6 +342,51 @@ pub fn set_complementary_book_from_quote(book: &mut DenseBook, q: RecordedQuote)
     if no_ask.0 < 1_000_000 {
         book.set_level(Side::Ask, no_ask, qty_from_f64(q.bid_size));
     }
+}
+
+/// Checks the assumption `set_complementary_book_from_quote` has to make
+/// against two *independently recorded* real quote series instead of
+/// assuming it: real complementarity would mean `no.bid == 1 - yes.ask`
+/// and `no.ask == 1 - yes.bid` at every matched instant. `yes_market` and
+/// `no_market` are two `market` values recorded in the same `text` (the
+/// shipped recorder writes the NO side as `{market}-no`) — matched by
+/// *absolute* recorded time, deliberately not through `load_recording`'s
+/// already-normalised `t_s`, which zeroes each market's own first row
+/// independently and would silently compare the wrong instants whenever
+/// the two series' recordings did not start on the exact same poll.
+///
+/// Each returned pair is `(bid_error, ask_error)`, the absolute deviation
+/// from perfect complementarity in price units, one entry per
+/// `no_market` snapshot matched against the most recent `yes_market`
+/// quote at or before it (same "hold forward" semantics as `lookup`). A
+/// `no_market` snapshot with nothing in `yes_market` yet to compare
+/// against is skipped, not treated as zero error.
+pub fn complementarity_error(text: &str, yes_market: &str, no_market: &str) -> Vec<(f64, f64)> {
+    let yes_rows = parse_quote_rows(text, yes_market);
+    let no_rows = parse_quote_rows(text, no_market);
+    let mut out = Vec::with_capacity(no_rows.len());
+    for (t_unix, n) in &no_rows {
+        if yes_rows.is_empty() || *t_unix < yes_rows[0].0 {
+            continue;
+        }
+        let mut lo = 0usize;
+        let mut hi = yes_rows.len();
+        while lo + 1 < hi {
+            let mid = (lo + hi) / 2;
+            if yes_rows[mid].0 <= *t_unix {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        let Some((_, y)) = yes_rows.get(lo) else {
+            continue;
+        };
+        let bid_error = (n.bid - (1.0 - y.ask)).abs();
+        let ask_error = (n.ask - (1.0 - y.bid)).abs();
+        out.push((bid_error, ask_error));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -297,5 +516,185 @@ not,a,valid,line,at,all
         set_book_from_quote(&mut book, q);
         assert_eq!(book.best_bid(), None);
         assert_eq!(book.best_ask(), None);
+    }
+
+    const L2_SAMPLE: &str = "\
+# comment
+1000.000,btc_4h,bid,0.55:100.0,0.54:200.0,0.53:50.0
+1000.000,btc_4h,ask,0.57:80.0,0.58:120.0
+1000.500,btc_1h,bid,0.20:40.0
+1000.500,btc_1h,ask,0.22:30.0
+not,a,valid,row
+1003.000,btc_4h,bid,0.60:90.0,malformed,0.58:20.0
+1003.000,btc_4h,ask,0.62:75.0
+";
+
+    #[test]
+    fn l2_loads_only_the_requested_market_with_full_depth() {
+        let snaps = load_recording_l2(L2_SAMPLE, "btc_4h");
+        assert_eq!(snaps.len(), 2);
+        assert!(snaps[0].t_s.abs() < 1e-9);
+        assert_eq!(snaps[0].bids.len(), 3);
+        assert_eq!(snaps[0].asks.len(), 2);
+        assert!((snaps[0].bids[0].price - 0.55).abs() < 1e-12);
+        assert!((snaps[0].bids[2].price - 0.53).abs() < 1e-12);
+        // Second snapshot's bid row has one malformed level ("malformed")
+        // between two good ones — skipped, not fatal to the row.
+        assert_eq!(snaps[1].bids.len(), 2);
+        assert!((snaps[1].t_s - 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn l2_a_different_market_gets_its_own_snapshots() {
+        let snaps = load_recording_l2(L2_SAMPLE, "btc_1h");
+        assert_eq!(snaps.len(), 1);
+        assert_eq!(snaps[0].bids.len(), 1);
+        assert_eq!(snaps[0].asks.len(), 1);
+    }
+
+    #[test]
+    fn l2_unknown_market_is_empty_not_an_error() {
+        assert!(load_recording_l2(L2_SAMPLE, "eth_4h").is_empty());
+    }
+
+    #[test]
+    fn l2_lookup_holds_the_last_known_snapshot_forward() {
+        let snaps = load_recording_l2(L2_SAMPLE, "btc_4h");
+        let at = lookup_l2(&snaps, 5.0).unwrap();
+        assert!((at.t_s - 3.0).abs() < 1e-9);
+        let before_first = lookup_l2(&snaps, -1.0);
+        assert!(before_first.is_none());
+    }
+
+    #[test]
+    fn l2_set_book_places_every_level_not_just_the_touch() {
+        let mut book = DenseBook::new(10_000);
+        let snap = RecordedBookSnapshot {
+            t_s: 0.0,
+            bids: vec![
+                RecordedLevel {
+                    price: 0.55,
+                    size: 100.0,
+                },
+                RecordedLevel {
+                    price: 0.54,
+                    size: 200.0,
+                },
+            ],
+            asks: vec![RecordedLevel {
+                price: 0.57,
+                size: 80.0,
+            }],
+        };
+        set_book_from_l2_snapshot(&mut book, &snap);
+        assert_eq!(book.best_bid(), Some(Px::from_f64(0.55)));
+        assert_eq!(
+            book.size_at(Side::Bid, Px::from_f64(0.54)),
+            qty_from_f64(200.0)
+        );
+        assert_eq!(book.best_ask(), Some(Px::from_f64(0.57)));
+    }
+
+    #[test]
+    fn a_real_l2_recording_loads_and_populates_a_book_with_real_depth() {
+        // Real full-depth data captured 2026-08-16 with tools/px-record's
+        // L2 mode — see recordings/README.md. Proves `load_recording_l2`
+        // and `set_book_from_l2_snapshot` work end to end against actual
+        // venue responses, not just the hand-built fixture above.
+        let raw = include_str!("../../../recordings/polymarket_l2_sample.csv");
+        let snaps = load_recording_l2(raw, "btc-updown-5m-1786860300");
+        assert!(
+            snaps.len() > 10,
+            "expected a substantial real L2 recording, got {} snapshots",
+            snaps.len()
+        );
+        // Real depth, not just a touch: this market's book runs dozens of
+        // levels deep on both sides (see recordings/README.md).
+        let deepest = snaps.iter().map(|s| s.bids.len()).max().unwrap_or(0);
+        assert!(deepest > 10, "expected multi-level depth, got {deepest}");
+
+        let mut book = DenseBook::new(10_000);
+        for snap in &snaps {
+            set_book_from_l2_snapshot(&mut book, snap);
+            assert!(book.best_bid().is_some());
+            assert!(book.best_ask().is_some());
+            assert!(!book.is_crossed(), "real book crossed at t_s={}", snap.t_s);
+            // Depth beyond the touch must actually be there, not just the
+            // first level — the whole point of L2 over `RecordedQuote`.
+            let last_bid = snap.bids.last().unwrap();
+            assert!(
+                book.size_at(Side::Bid, Px::from_f64(last_bid.price)) > Qty::ZERO,
+                "deepest recorded bid level did not make it into the book"
+            );
+        }
+    }
+
+    #[test]
+    fn perfectly_complementary_quotes_have_zero_error() {
+        let text = "\
+1000.000,m,0.49,80,0.50,30
+1000.000,m-no,0.50,30,0.51,80
+1003.000,m,0.55,10,0.57,20
+1003.000,m-no,0.43,20,0.45,10
+";
+        let errors = complementarity_error(text, "m", "m-no");
+        assert_eq!(errors.len(), 2);
+        for (bid_error, ask_error) in errors {
+            assert!(bid_error < 1e-12, "bid_error {bid_error}");
+            assert!(ask_error < 1e-12, "ask_error {ask_error}");
+        }
+    }
+
+    #[test]
+    fn a_real_deviation_from_complementarity_is_not_hidden() {
+        // NO's book is 2c wider than YES's complement would predict on
+        // both sides — the two venue-side books are not, in this
+        // fixture, perfectly mirrored.
+        let text = "\
+1000.000,m,0.49,80,0.50,30
+1000.000,m-no,0.48,30,0.53,80
+";
+        let errors = complementarity_error(text, "m", "m-no");
+        assert_eq!(errors.len(), 1);
+        let (bid_error, ask_error) = errors[0];
+        assert!((bid_error - 0.02).abs() < 1e-9, "bid_error {bid_error}");
+        assert!((ask_error - 0.02).abs() < 1e-9, "ask_error {ask_error}");
+    }
+
+    #[test]
+    fn complementarity_error_matches_on_absolute_time_not_normalised_t_s() {
+        // `no`'s single row is genuinely complementary to `yes`'s row at
+        // the same real instant (t=1200) — but `no`'s recording starts
+        // later than `yes`'s, so if this matched on each series' own
+        // independently-zeroed `t_s` (as it would if it reused
+        // `load_recording`'s output directly, where both series' first
+        // row is `t_s = 0`) it would instead compare `no` against
+        // `yes`'s *first* row (t=1000, `t_s = 0` in `yes`'s own
+        // numbering) and report a large, entirely artefactual error.
+        let text = "\
+1000.000,m,0.90,1,0.91,1
+1100.000,m,0.80,1,0.81,1
+1200.000,m,0.50,1,0.51,1
+1300.000,m,0.10,1,0.11,1
+1250.000,m-no,0.49,1,0.50,1
+";
+        let errors = complementarity_error(text, "m", "m-no");
+        assert_eq!(errors.len(), 1);
+        // Correctly matched against the t=1200 YES row (0.50/0.51) — a
+        // real, near-zero complementarity error — not the t=1000 row
+        // (0.90/0.91) a `t_s`-based match would wrongly pick, which would
+        // read as ~0.40 of error where none exists.
+        let (bid_error, ask_error) = errors[0];
+        assert!(bid_error < 1e-9, "bid_error {bid_error}");
+        assert!(ask_error < 1e-9, "ask_error {ask_error}");
+    }
+
+    #[test]
+    fn complementarity_error_before_any_yes_quote_is_skipped() {
+        let text = "\
+1000.000,m-no,0.50,30,0.51,80
+1500.000,m,0.49,80,0.50,30
+";
+        assert!(complementarity_error(text, "m", "m-no").is_empty());
     }
 }

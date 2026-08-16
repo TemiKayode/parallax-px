@@ -18,7 +18,7 @@ use crate::num::{Px, Qty, Usd};
 
 /// Number of addressable price levels: 0.000 .. 1.000 inclusive, milli-dollar grid.
 pub const LEVELS: usize = 1001;
-const WORDS: usize = (LEVELS + 63) / 64;
+const WORDS: usize = LEVELS.div_ceil(64);
 
 /// Largest resting size we will accept at one level: one billion shares, in
 /// micro-shares. Polymarket's largest markets rest a few hundred thousand
@@ -55,7 +55,12 @@ pub struct Walk {
 
 impl Walk {
     /// Slippage versus the touch, in micro-dollars per share. Always >= 0.
+    ///
+    /// `avg_px` and `touch` are both `Px`, bounded to `[0, 1_000_000]` —
+    /// the difference is well inside `i32`, and `.abs()` of it cannot
+    /// reach `i32::MIN`'s unrepresentable positive counterpart.
     #[inline(always)]
+    #[allow(clippy::arithmetic_side_effects)]
     pub fn slippage_vs(&self, touch: Px) -> i32 {
         if self.filled.is_zero() {
             0
@@ -157,22 +162,37 @@ impl DenseBook {
         Some((px.0 as usize) / 1000)
     }
 
+    /// Every caller passes an `idx` already bounded to `< LEVELS` (1001),
+    /// so the product tops out at `1_000_000` — exactly `Px::ONE`, never
+    /// past it.
     #[inline(always)]
+    #[allow(clippy::arithmetic_side_effects)]
     fn px_of(idx: usize) -> Px {
         Px((idx as i32) * 1000)
     }
 
+    /// `i` is always a level index already validated by `idx` (`< LEVELS`
+    /// = 1001), so `i >> 6` is at most 15 — inside `WORDS` = 16 — and
+    /// `i & 63` is a bit position, never a second index. Both the word
+    /// index and the arithmetic that builds it are bounded by that same
+    /// invariant, not by anything this function itself checks.
     #[inline(always)]
+    #[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
     fn set_bit(occ: &mut [u64; WORDS], i: usize) {
         occ[i >> 6] |= 1u64 << (i & 63);
     }
 
     #[inline(always)]
+    #[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
     fn clear_bit(occ: &mut [u64; WORDS], i: usize) {
         occ[i >> 6] &= !(1u64 << (i & 63));
     }
 
+    /// `w` is bounded by the `while w < WORDS` guard on every read, and
+    /// `(w << 6) + trailing_zeros` is at most `15*64 + 63 = 1023` —
+    /// nowhere near overflowing `usize`.
     #[inline(always)]
+    #[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
     fn lowest_set(occ: &[u64; WORDS]) -> Option<usize> {
         let mut w = 0;
         while w < WORDS {
@@ -185,7 +205,11 @@ impl DenseBook {
         None
     }
 
+    /// `w` is decremented from `WORDS` *before* every read, so it is
+    /// always `< WORDS`, and never reaches zero from below (the loop
+    /// exits via `w > 0` first) — same bound as `lowest_set` above.
     #[inline(always)]
+    #[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
     fn highest_set(occ: &[u64; WORDS]) -> Option<usize> {
         let mut w = WORDS;
         while w > 0 {
@@ -203,7 +227,13 @@ impl DenseBook {
     /// not an increment — which is exactly what we want: it is idempotent, so a
     /// duplicated message is harmless.
     /// Returns `false` if the update was rejected as malformed.
+    ///
+    /// `i` comes only from `Self::idx`, which already returned `None` (and
+    /// this function already returned) for anything outside `[0, LEVELS)`
+    /// — see `idx`'s own doc comment for why that check exists and lives
+    /// exactly there, at the untrusted-input boundary.
     #[inline]
+    #[allow(clippy::indexing_slicing)]
     pub fn set_level(&mut self, side: Side, px: Px, size: Qty) -> bool {
         let i = match Self::idx(px) {
             Some(i) => i,
@@ -261,7 +291,10 @@ impl DenseBook {
 
     /// Resting size at a price. An out-of-domain price holds nothing, by
     /// definition — reporting zero is both true and safe.
+    ///
+    /// `i` comes only from `Self::idx`, same guarantee as `set_level`.
     #[inline(always)]
+    #[allow(clippy::indexing_slicing)]
     pub fn size_at(&self, side: Side, px: Px) -> Qty {
         let i = match Self::idx(px) {
             Some(i) => i,
@@ -276,7 +309,11 @@ impl DenseBook {
     /// Midpoint, or `None` if either side is empty. Note we deliberately do not
     /// fall back to a one-sided proxy: a one-sided book is a data-quality event,
     /// and the caller should treat it as such rather than quote off a guess.
+    ///
+    /// `b.0` and `a.0` are each in `[0, 1_000_000]`, so the sum is bounded
+    /// well inside `i32`.
     #[inline]
+    #[allow(clippy::arithmetic_side_effects)]
     pub fn mid(&self) -> Option<Px> {
         match (self.best_bid(), self.best_ask()) {
             (Some(b), Some(a)) => Some(Px((b.0 + a.0) / 2)),
@@ -284,7 +321,12 @@ impl DenseBook {
         }
     }
 
+    /// `a.0` and `b.0` are each in `[0, 1_000_000]`, so the difference is
+    /// bounded well inside `i32`; the division is by `self.tick`, which is
+    /// always constructed positive (`DenseBook::new`'s only caller-supplied
+    /// tick values are 10_000 or 1_000).
     #[inline]
+    #[allow(clippy::arithmetic_side_effects)]
     pub fn spread_ticks(&self) -> Option<i32> {
         match (self.best_bid(), self.best_ask()) {
             (Some(b), Some(a)) => Some((a.0 - b.0) / self.tick),
@@ -294,6 +336,14 @@ impl DenseBook {
 
     /// Total resting size no worse than `limit`. Answers "how much can I lift
     /// without paying more than X".
+    ///
+    /// Every index below is either the result of `lowest_set`/
+    /// `highest_set` (already `< LEVELS`) or explicitly re-checked by the
+    /// loop guard immediately before use — `i < LEVELS` on the ask side,
+    /// `i == 0` breaking before the bid side's `i -= 1` can underflow. The
+    /// running `total` is bounded by `LEVELS * MAX_LEVEL_QTY` (~1e18),
+    /// inside `i64`'s ~9.2e18 range with room to spare.
+    #[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
     pub fn depth_to(&self, side: Side, limit: Px) -> Qty {
         let mut total = 0i64;
         match side {
@@ -369,7 +419,14 @@ impl DenseBook {
         )
     }
 
+    /// `u` is re-derived from `i` immediately after the `i < 0 || i as
+    /// usize >= LEVELS` guard breaks the loop, so `qty[u]` is always in
+    /// range. `cash` accumulates in `i128` specifically so the
+    /// price*quantity products here have headroom regardless of `filled`;
+    /// `filled`/`remaining` are bounded by `want.0`, and `levels: u16`
+    /// increments at most `LEVELS` (1001) times, nowhere near `u16::MAX`.
     #[inline]
+    #[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
     fn walk(&self, start: usize, stop: usize, step: isize, want: Qty, qty: &[i64; LEVELS]) -> Walk {
         let mut remaining = want.0;
         let mut cash = 0i128;
@@ -435,6 +492,11 @@ impl DenseBook {
     /// than assuming the requested size is the right one — walking deeper buys
     /// more shares at a worse average, and where that trade-off turns is a
     /// property of the book, not of our intent.
+    ///
+    /// Same bound as `depth_to`: the ask side's `i` is guarded by
+    /// `i < LEVELS` before every read, and the bid side's `i` only ever
+    /// decrements after an explicit `i == 0` check, so it cannot underflow.
+    #[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
     pub fn for_each_level<F>(&self, side: Side, mut f: F)
     where
         F: FnMut(Px, Qty) -> bool,
@@ -484,6 +546,10 @@ impl DenseBook {
 
     /// Sum of resting size on both sides. Feeds the liquidity term of the
     /// fair-value model and the "is this market alive" check.
+    ///
+    /// `i` ranges over `0..LEVELS` directly, and `t` is bounded by
+    /// `2 * LEVELS * MAX_LEVEL_QTY` (~2e18) — inside `i64`'s ~9.2e18 range.
+    #[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
     pub fn total_depth(&self) -> Qty {
         let mut t = 0i64;
         for i in 0..LEVELS {
